@@ -5,3 +5,24 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+
+  backend:
+    image: securo-backend:custom
+    pull_policy: never
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+  celery-worker:
+    image: securo-backend:custom
+    pull_policy: never
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+
+  celery-beat:
+    image: securo-backend:custom
+    pull_policy: never
+    build:
+      context: ./backend
+      dockerfile: Dockerfile

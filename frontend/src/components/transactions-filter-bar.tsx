@@ -196,7 +196,9 @@ export function TransactionsFilterBar({
       ? t('transactions.income')
       : filterType === 'debit'
         ? t('transactions.expense')
-        : ''
+        : filterType === 'transfer'
+          ? t('transactions.transfer')
+          : ''
 
   const dateLabel = useMemo(() => {
     if (!filterFrom && !filterTo) return null
@@ -618,6 +620,7 @@ export function TransactionsFilterBar({
                         { value: '', label: t('transactions.all') },
                         { value: 'credit', label: t('transactions.income') },
                         { value: 'debit', label: t('transactions.expense') },
+                        { value: 'transfer', label: t('transactions.transfer') },
                       ].map((opt) => (
                         <DropdownMenuItem
                           key={opt.value || 'all'}

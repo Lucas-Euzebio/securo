@@ -67,6 +67,7 @@ async def get_transactions(
     txn_type: Optional[str] = None,
     skip_pagination: bool = False,
     exclude_transfers: bool = False,
+    transfer_only: bool = False,
     account_ids: Optional[list[uuid.UUID]] = None,
     category_ids: Optional[list[uuid.UUID]] = None,
     accounting_mode: Optional[str] = None,
@@ -214,6 +215,8 @@ async def get_transactions(
         )
     if exclude_transfers:
         base_query = base_query.where(Transaction.transfer_pair_id.is_(None))
+    if transfer_only:
+        base_query = base_query.where(Transaction.transfer_pair_id.is_not(None))
     if txn_type:
         base_query = base_query.where(Transaction.type == txn_type)
     if currency:
