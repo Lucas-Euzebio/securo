@@ -1,0 +1,7 @@
+services:
+  frontend:
+    image: securo-frontend:custom
+    pull_policy: never
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
