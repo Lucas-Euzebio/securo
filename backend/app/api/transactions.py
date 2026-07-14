@@ -15,7 +15,7 @@ from app.core.workspace_context import (
     current_workspace,
     current_writable_workspace,
 )
-from app.schemas.transaction import BulkAddToGroupRequest, BulkCategorizeRequest, BulkTagsRequest, CreateCounterpartRequest, LinkTransferRequest, TransactionCreate, TransactionRead, TransactionUpdate, TransferCreate, TransferRead
+from app.schemas.transaction import BulkAddToGroupRequest, BulkCategorizeRequest, BulkTagsRequest, CreateCounterpartRequest, LinkTransferRequest, TransactionCreate, TransactionRead, TransactionSplitPartsRequest, TransactionUpdate, TransferCreate, TransferRead
 from app.services import transaction_service
 from app.services.admin_service import get_credit_card_accounting_mode
 
@@ -404,13 +404,54 @@ async def toggle_ignore_transaction(
     ctx: WorkspaceContext = Depends(current_writable_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
-    transaction = await transaction_service.toggle_ignore_transaction(
-        session, transaction_id, ctx.workspace.id
-    )
+    try:
+        transaction = await transaction_service.toggle_ignore_transaction(
+            session, transaction_id, ctx.workspace.id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     if not transaction:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
     primary_currency = ctx.user.primary_currency
     return _tag_fx_fallback(TransactionRead.model_validate(transaction, from_attributes=True), primary_currency)
+
+
+@router.post("/{transaction_id}/split-parts", response_model=list[TransactionRead])
+async def split_transaction_into_parts(
+    transaction_id: uuid.UUID,
+    data: TransactionSplitPartsRequest,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Split a transaction into N manual child transactions, one per
+    category. Returns the updated parent followed by the new children."""
+    try:
+        parent, children = await transaction_service.split_transaction_into_parts(
+            session, transaction_id, ctx.workspace.id, ctx.user_id, data.parts
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    primary_currency = ctx.user.primary_currency
+    return [
+        _tag_fx_fallback(TransactionRead.model_validate(tx, from_attributes=True), primary_currency)
+        for tx in [parent, *children]
+    ]
+
+
+@router.delete("/{transaction_id}/split-parts", status_code=status.HTTP_204_NO_CONTENT)
+async def revert_split_transaction(
+    transaction_id: uuid.UUID,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Undo a previous split-into-parts: delete the children and restore
+    the parent."""
+    try:
+        await transaction_service.revert_split_transaction(
+            session, transaction_id, ctx.workspace.id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.patch("/{transaction_id}/unlink-recurring", response_model=TransactionRead)
@@ -437,8 +478,11 @@ async def delete_transaction(
     ctx: WorkspaceContext = Depends(current_writable_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
-    deleted = await transaction_service.delete_transaction(
-        session, transaction_id, ctx.workspace.id
-    )
+    try:
+        deleted = await transaction_service.delete_transaction(
+            session, transaction_id, ctx.workspace.id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")

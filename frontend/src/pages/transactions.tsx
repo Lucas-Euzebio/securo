@@ -48,7 +48,7 @@ import { PageHeader } from '@/components/page-header'
 import { calculateRangeSelection } from '@/lib/selection-utils'
 import { CategoryIcon } from '@/components/category-icon'
 import { CategorySelect } from '@/components/category-select'
-import { TransactionDialog, extractApiError, type SaveAction } from '@/components/transaction-dialog'
+import { TransactionDialog, extractApiError, extractTxApiError, type SaveAction } from '@/components/transaction-dialog'
 import { TransactionsColumnPicker } from '@/components/transactions-column-picker'
 import { type ColumnDef, type ColumnId, useTransactionsGridState } from '@/components/transactions-grid-columns'
 import { TransferDialog } from '@/components/transfer-dialog'
@@ -476,7 +476,7 @@ export default function TransactionsPage() {
       toast.success(t('transactions.updated'))
     },
     onError: (error) => {
-      toast.error(extractApiError(error))
+      toast.error(extractTxApiError(error, t))
     },
   })
 
@@ -489,7 +489,7 @@ export default function TransactionsPage() {
       toast.success(t('transactions.deleted'))
     },
     onError: (error) => {
-      toast.error(extractApiError(error))
+      toast.error(extractTxApiError(error, t))
     },
   })
 
@@ -942,6 +942,26 @@ export default function TransactionsPage() {
                 {t('splitGroups.settlementRowBadge', {
                   group: groupNameById.get(tx.settlement_group_id) ?? '',
                 })}
+              </span>
+            )}
+            {!!tx.split_children?.length && (
+              <span
+                className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-amber-700 bg-amber-50 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900 px-1.5 py-0.5 rounded-full"
+                title={tx.split_children
+                  .map((c) => `${c.description ?? tx.description}: ${formatCurrency(Math.abs(Number(c.amount)), tx.currency, locale)}`)
+                  .join('\n')}
+              >
+                {t('transactions.splitPartsParentBadge', { count: tx.split_children.length })}
+              </span>
+            )}
+            {tx.parent_transaction_id && (
+              <span
+                className="inline-flex items-center gap-1 max-w-[180px] text-[10px] font-semibold uppercase tracking-wide text-amber-700 bg-amber-50 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900 px-1.5 py-0.5 rounded-full"
+                title={t('transactions.splitPartsChildBadge', { parent: tx.split_parent_description ?? '' })}
+              >
+                <span className="truncate">
+                  {t('transactions.splitPartsChildBadge', { parent: tx.split_parent_description ?? '' })}
+                </span>
               </span>
             )}
             {!!tx.transfer_pair_id && (

@@ -58,6 +58,13 @@ class TransactionUpdate(BaseModel):
     splits: Optional[TransactionSplitsInput] = None
 
 
+class SplitChildInfo(BaseModel):
+    id: uuid.UUID
+    amount: Decimal
+    description: Optional[str] = None
+    category_id: Optional[uuid.UUID] = None
+
+
 class TransactionRead(TransactionBase):
     id: uuid.UUID
     user_id: uuid.UUID
@@ -83,6 +90,10 @@ class TransactionRead(TransactionBase):
     bill_id: Optional[uuid.UUID] = None
     effective_bill_date: Optional[_Date] = None
     recurring_transaction_id: Optional[uuid.UUID] = None
+    # Self-FK: set on a child transaction created by "split into parts",
+    # pointing back at the original (now-ignored) transaction it was carved
+    # out of.
+    parent_transaction_id: Optional[uuid.UUID] = None
     splits: list[TransactionSplitRead] = []
     # Shared-transaction view fields. Set per-request when the viewer
     # is a linked member of one of this transaction's splits but not
@@ -101,9 +112,25 @@ class TransactionRead(TransactionBase):
     # expense. Lets the UI badge a settlement payoff even though it has
     # no splits of its own.
     settlement_group_id: Optional[uuid.UUID] = None
+    # "Split into parts" tag fields — populated in-memory by
+    # `_tag_split_parts`, not columns. On the parent: the list of child
+    # transactions it was divided into. On a child: the parent's
+    # description, so the UI can show "Part of {description}".
+    split_children: Optional[list[SplitChildInfo]] = None
+    split_parent_description: Optional[str] = None
     is_ignored: bool = False
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class TransactionSplitPartInput(BaseModel):
+    amount: Decimal
+    category_id: Optional[uuid.UUID] = None
+    description: Optional[str] = None
+
+
+class TransactionSplitPartsRequest(BaseModel):
+    parts: list[TransactionSplitPartInput]
 
 
 class BulkCategorizeRequest(BaseModel):

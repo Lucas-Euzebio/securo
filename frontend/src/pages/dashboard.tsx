@@ -43,7 +43,7 @@ import { PageHeader } from '@/components/page-header'
 import { CategoryIcon } from '@/components/category-icon'
 import { AccountIcon } from '@/components/account-icon'
 import { TransactionDrillDown, type DrillDownFilter } from '@/components/transaction-drill-down'
-import { TransactionDialog, extractApiError } from '@/components/transaction-dialog'
+import { TransactionDialog, extractTxApiError } from '@/components/transaction-dialog'
 import { RuleDialog, type RuleDialogInitialData } from '@/components/rule-dialog'
 import { usePrivacyMode } from '@/hooks/use-privacy-mode'
 import { useAuth } from '@/contexts/auth-context'
@@ -422,6 +422,12 @@ export default function DashboardPage() {
     // groupId/groupName above, which only cover the original split.
     settlementGroupId: string | null
     settlementGroupName: string | null
+    // "Split into parts": children of a divided parent (for the parent's
+    // badge + tooltip) and the parent's description (for a child's badge).
+    splitChildren: { id: string; amount: number; description: string | null; category_id: string | null }[] | null
+    splitParentDescription: string | null
+    isParentOfSplit: boolean
+    isChildOfSplit: boolean
     isIgnored: boolean
   }
 
@@ -473,6 +479,10 @@ export default function DashboardPage() {
         settlementGroupName: tx.settlement_group_id
           ? groupNameById.get(tx.settlement_group_id) ?? null
           : null,
+        splitChildren: tx.split_children ?? null,
+        splitParentDescription: tx.split_parent_description ?? null,
+        isParentOfSplit: !!tx.split_children?.length,
+        isChildOfSplit: !!tx.parent_transaction_id,
         isIgnored: tx.is_ignored
       })
     }
@@ -499,6 +509,10 @@ export default function DashboardPage() {
         groupName: null,
         settlementGroupId: null,
         settlementGroupName: null,
+        splitChildren: null,
+        splitParentDescription: null,
+        isParentOfSplit: false,
+        isChildOfSplit: false,
         isIgnored: pt.is_ignored
       })
     }
@@ -1111,6 +1125,26 @@ export default function DashboardPage() {
                                   })}
                                 </span>
                               )}
+                              {row.isParentOfSplit && (
+                                <span
+                                  className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900 shrink-0 uppercase tracking-wide"
+                                  title={(row.splitChildren ?? [])
+                                    .map((c) => `${c.description ?? row.description}: ${formatCurrency(Math.abs(Number(c.amount)), row.currency, locale)}`)
+                                    .join('\n')}
+                                >
+                                  {t('transactions.splitPartsParentBadge', { count: row.splitChildren?.length ?? 0 })}
+                                </span>
+                              )}
+                              {row.isChildOfSplit && (
+                                <span
+                                  className="inline-flex items-center max-w-[180px] px-1.5 py-0.5 rounded text-[10px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 dark:bg-amber-950/40 dark:text-amber-300 dark:border-amber-900 shrink-0 uppercase tracking-wide"
+                                  title={t('transactions.splitPartsChildBadge', { parent: row.splitParentDescription ?? '' })}
+                                >
+                                  <span className="truncate">
+                                    {t('transactions.splitPartsChildBadge', { parent: row.splitParentDescription ?? '' })}
+                                  </span>
+                                </span>
+                              )}
                               {row.isProjected && (
                                 <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-violet-100 text-violet-600 shrink-0">
                                   {t('transactions.recurringBadge')}
@@ -1273,7 +1307,7 @@ export default function DashboardPage() {
           handleCreateRuleFromTransaction(tx)
         }}
         loading={updateMutation.isPending || deleteMutation.isPending || unlinkTransferMutation.isPending}
-        error={updateMutation.error ? extractApiError(updateMutation.error) : deleteMutation.error ? extractApiError(deleteMutation.error) : null}
+        error={updateMutation.error ? extractTxApiError(updateMutation.error, t) : deleteMutation.error ? extractTxApiError(deleteMutation.error, t) : null}
         isSynced={!!editingTx?.external_id}
       />
 

@@ -993,6 +993,11 @@ async def apply_single_rule(
         select(Transaction).where(
             Transaction.workspace_id == workspace_id,
             Transaction.source != "opening_balance",
+            # Exclude split children: a rule action can set is_ignored=True,
+            # which would silently drop part of a split's sum out of
+            # reports. Splits are always manually categorized by the user
+            # at creation time, so they don't need rule backfill anyway.
+            Transaction.parent_transaction_id.is_(None),
         )
     )
     transactions = result.scalars().all()
@@ -1025,6 +1030,10 @@ async def apply_all_rules(session: AsyncSession, workspace_id: uuid.UUID) -> int
         .where(
             Transaction.workspace_id == workspace_id,
             Transaction.source != "opening_balance",
+            # Same reasoning as apply_single_rule: a matched rule can carry
+            # an is_ignored=True action, which would silently corrupt a
+            # split's sum if applied to one of its children.
+            Transaction.parent_transaction_id.is_(None),
         )
     )
     transactions = result.scalars().all()

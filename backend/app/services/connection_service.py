@@ -727,6 +727,10 @@ async def _fuzzy_match_manual(
             Transaction.type == txn_data.type,
             Transaction.date >= date_lo,
             Transaction.date <= date_hi,
+            # Never fuse an incoming synced transaction into a split
+            # child — it has its own amount (part of the original) and
+            # merging a bank charge into it would corrupt the split's sum.
+            Transaction.parent_transaction_id.is_(None),
         )
     )
     candidates = result.scalars().all()

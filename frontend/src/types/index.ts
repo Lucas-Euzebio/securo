@@ -236,6 +236,14 @@ export interface Transaction {
   settlement_group_id?: string | null
   // Flag to exclude this transaction from reports and dashboard aggregations
   is_ignored: boolean
+  // "Split into parts" — set on a child transaction created by splitting a
+  // bank transaction into multiple manual parts (one per category). Points
+  // back at the original (now-ignored) transaction.
+  parent_transaction_id?: string | null
+  // Set on the divided parent: the child transactions it was split into.
+  split_children?: { id: string; amount: number; description: string | null; category_id: string | null }[] | null
+  // Set on a child: the parent's description, for the "Part of {x}" badge.
+  split_parent_description?: string | null
 }
 
 export type ShareType = 'equal' | 'exact' | 'percent'

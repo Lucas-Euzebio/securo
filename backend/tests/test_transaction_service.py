@@ -7,9 +7,23 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account
+from app.models.category import Category
+from app.models.group import Group, GroupMember
+from app.models.group_settlement import GroupSettlement
 from app.models.rule import Rule
 from app.models.transaction import Transaction
-from app.schemas.transaction import TransactionCreate, TransactionUpdate, TransferCreate
+from app.models.transaction_split import TransactionSplit
+from app.providers.base import TransactionData
+from app.schemas.group import GroupCreate, GroupMemberCreate
+from app.schemas.transaction import (
+    TransactionCreate,
+    TransactionSplitPartInput,
+    TransactionUpdate,
+    TransferCreate,
+)
+from app.services import group_service
+from app.services.connection_service import _fuzzy_match_manual
+from app.services.transfer_detection_service import detect_transfer_pairs
 from app.services.transaction_service import (
     _apply_fx_override,
     bulk_add_tags,
@@ -18,6 +32,8 @@ from app.services.transaction_service import (
     create_transaction,
     create_transfer,
     delete_transaction,
+    revert_split_transaction,
+    split_transaction_into_parts,
     toggle_ignore_transaction,
     get_transaction,
     get_transactions,
@@ -1121,3 +1137,639 @@ async def test_bulk_remove_tags_clears_only_exact_matches(
     await session.refresh(t2)
     assert t1.notes == "#keep"
     assert t2.notes == "#test2 untouched"
+
+
+# ---------------------------------------------------------------------------
+# split_transaction_into_parts / revert_split_transaction
+# ---------------------------------------------------------------------------
+
+
+async def _mk_splittable_tx(
+    session: AsyncSession,
+    test_user,
+    account,
+    *,
+    amount: str = "60.00",
+    type_: str = "credit",
+    amount_primary: Decimal | None = None,
+    fx_rate_used: Decimal | None = None,
+    date: date = date(2026, 5, 1),
+    source: str = "manual",
+    **kw,
+) -> Transaction:
+    tx = Transaction(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        account_id=account.id,
+        description="Loan repayment + interest",
+        amount=Decimal(amount),
+        currency=account.currency,
+        date=date,
+        type=type_,
+        source=source,
+        amount_primary=amount_primary,
+        fx_rate_used=fx_rate_used,
+        created_at=datetime.now(timezone.utc),
+        **kw,
+    )
+    session.add(tx)
+    await session.commit()
+    await session.refresh(tx)
+    return tx
+
+
+async def _setup_group_with_settlement_target(
+    session: AsyncSession, test_user, test_workspace
+):
+    """A group with 2 members, for constructing a GroupSettlement/TransactionSplit
+    row directly (bypassing settlement_service, which needs a full linked-member
+    setup we don't need here — we only need the FK targets to be real rows)."""
+    group = await group_service.create_group(
+        session, test_workspace.id, test_user.id,
+        GroupCreate(name=f"G-{uuid.uuid4().hex[:6]}", default_currency="BRL"),
+    )
+    me = await group_service.create_member(
+        session, group.id, test_workspace.id, GroupMemberCreate(name="Me", is_self=True),
+    )
+    other = await group_service.create_member(
+        session, group.id, test_workspace.id, GroupMemberCreate(name="Other", is_self=False),
+    )
+    return group, me, other
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_happy(
+    session: AsyncSession, test_user, test_workspace, test_categories, txn_account
+):
+    original = await _mk_splittable_tx(
+        session, test_user, txn_account,
+        amount="60.00", amount_primary=Decimal("300.00"), fx_rate_used=Decimal("5.0"),
+    )
+
+    parent, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [
+            TransactionSplitPartInput(amount=Decimal("40.00"), category_id=test_categories[0].id, description="Principal"),
+            TransactionSplitPartInput(amount=Decimal("20.00"), category_id=test_categories[2].id, description="Interest"),
+        ],
+    )
+
+    assert parent.is_ignored is True
+    assert len(children) == 2
+    assert sum(c.amount for c in children) == Decimal("60.00")
+    for child in children:
+        assert child.parent_transaction_id == original.id
+        assert child.source == "manual"
+        assert child.account_id == original.account_id
+        assert child.date == original.date
+        assert child.effective_date == original.effective_date
+        assert child.type == original.type
+        assert child.currency == original.currency
+    assert children[0].description == "Principal"
+    assert children[1].description == "Interest"
+    # amount_primary proportional to each part, residual on the last child
+    assert children[0].amount_primary == Decimal("200.00")
+    assert children[1].amount_primary == Decimal("100.00")
+    assert children[0].fx_rate_used == Decimal("5.0")
+    assert sum(c.amount_primary for c in children) == parent.amount_primary
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_no_amount_primary(
+    session: AsyncSession, test_user, test_workspace, test_categories, txn_account
+):
+    """When the parent has no amount_primary, children get None too."""
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+
+    _, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [
+            TransactionSplitPartInput(amount=Decimal("40.00")),
+            TransactionSplitPartInput(amount=Decimal("20.00")),
+        ],
+    )
+    for child in children:
+        assert child.amount_primary is None
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_default_description(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    """A part without its own description falls back to the parent's."""
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+
+    _, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [
+            TransactionSplitPartInput(amount=Decimal("40.00")),
+            TransactionSplitPartInput(amount=Decimal("20.00"), description="Interest"),
+        ],
+    )
+    assert children[0].description == original.description
+    assert children[1].description == "Interest"
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_too_few_parts(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    with pytest.raises(ValueError, match="between 2 and 20"):
+        await split_transaction_into_parts(
+            session, original.id, test_workspace.id, test_user.id,
+            [TransactionSplitPartInput(amount=Decimal("60.00"))],
+        )
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_too_many_parts(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="21.00")
+    parts = [TransactionSplitPartInput(amount=Decimal("1.00")) for _ in range(21)]
+    with pytest.raises(ValueError, match="between 2 and 20"):
+        await split_transaction_into_parts(
+            session, original.id, test_workspace.id, test_user.id, parts,
+        )
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_wrong_sum(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    with pytest.raises(ValueError, match="add up"):
+        await split_transaction_into_parts(
+            session, original.id, test_workspace.id, test_user.id,
+            [
+                TransactionSplitPartInput(amount=Decimal("40.00")),
+                TransactionSplitPartInput(amount=Decimal("15.00")),
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_nonpositive_amount(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    with pytest.raises(ValueError, match="positive"):
+        await split_transaction_into_parts(
+            session, original.id, test_workspace.id, test_user.id,
+            [
+                TransactionSplitPartInput(amount=Decimal("60.00")),
+                TransactionSplitPartInput(amount=Decimal("0")),
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_already_split(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    with pytest.raises(ValueError, match="already split"):
+        await split_transaction_into_parts(
+            session, original.id, test_workspace.id, test_user.id,
+            [TransactionSplitPartInput(amount=Decimal("30.00")), TransactionSplitPartInput(amount=Decimal("30.00"))],
+        )
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_rejects_a_child(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    _, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    with pytest.raises(ValueError, match="already part of a split"):
+        await split_transaction_into_parts(
+            session, children[0].id, test_workspace.id, test_user.id,
+            [TransactionSplitPartInput(amount=Decimal("20.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+        )
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_rejects_transfer_leg(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(
+        session, test_user, txn_account, amount="60.00", transfer_pair_id=uuid.uuid4(),
+    )
+    with pytest.raises(ValueError, match="transfer leg"):
+        await split_transaction_into_parts(
+            session, original.id, test_workspace.id, test_user.id,
+            [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+        )
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_rejects_ignored(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00", is_ignored=True)
+    with pytest.raises(ValueError, match="ignored"):
+        await split_transaction_into_parts(
+            session, original.id, test_workspace.id, test_user.id,
+            [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+        )
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_rejects_settlement_source(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00", source="settlement")
+    with pytest.raises(ValueError, match="settlement transaction"):
+        await split_transaction_into_parts(
+            session, original.id, test_workspace.id, test_user.id,
+            [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+        )
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_rejects_settlement_link(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    group, me, other = await _setup_group_with_settlement_target(session, test_user, test_workspace)
+    settlement = GroupSettlement(
+        id=uuid.uuid4(), group_id=group.id, workspace_id=test_workspace.id,
+        from_member_id=me.id, to_member_id=other.id, amount=Decimal("60.00"),
+        currency="BRL", date=date(2026, 5, 1), transaction_id=original.id,
+    )
+    session.add(settlement)
+    await session.commit()
+
+    with pytest.raises(ValueError, match="settlement"):
+        await split_transaction_into_parts(
+            session, original.id, test_workspace.id, test_user.id,
+            [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+        )
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_rejects_group_splits(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    group, me, other = await _setup_group_with_settlement_target(session, test_user, test_workspace)
+    split = TransactionSplit(
+        id=uuid.uuid4(), transaction_id=original.id, workspace_id=test_workspace.id,
+        group_member_id=other.id, share_amount=Decimal("30.00"), share_type="exact",
+    )
+    session.add(split)
+    await session.commit()
+
+    with pytest.raises(ValueError, match="group splits"):
+        await split_transaction_into_parts(
+            session, original.id, test_workspace.id, test_user.id,
+            [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+        )
+
+
+@pytest.mark.asyncio
+async def test_split_transaction_into_parts_not_found(
+    session: AsyncSession, test_user, test_workspace,
+):
+    with pytest.raises(ValueError, match="not found"):
+        await split_transaction_into_parts(
+            session, uuid.uuid4(), test_workspace.id, test_user.id,
+            [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+        )
+
+
+@pytest.mark.asyncio
+async def test_revert_split_transaction_happy(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    parent, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    assert parent.is_ignored is True
+
+    reverted = await revert_split_transaction(session, original.id, test_workspace.id)
+    assert reverted.is_ignored is False
+
+    for child in children:
+        assert await get_transaction(session, child.id, test_workspace.id) is None
+    assert await _has_split_children_helper(session, original.id) is False
+
+
+async def _has_split_children_helper(session: AsyncSession, transaction_id) -> bool:
+    from app.services.transaction_service import _has_split_children
+    return await _has_split_children(session, transaction_id)
+
+
+@pytest.mark.asyncio
+async def test_revert_split_transaction_not_split(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    with pytest.raises(ValueError, match="not split"):
+        await revert_split_transaction(session, original.id, test_workspace.id)
+
+
+@pytest.mark.asyncio
+async def test_revert_split_transaction_refuses_settlement_on_child(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    _, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    group, me, other = await _setup_group_with_settlement_target(session, test_user, test_workspace)
+    settlement = GroupSettlement(
+        id=uuid.uuid4(), group_id=group.id, workspace_id=test_workspace.id,
+        from_member_id=me.id, to_member_id=other.id, amount=Decimal("20.00"),
+        currency="BRL", date=date(2026, 5, 1), transaction_id=children[1].id,
+    )
+    session.add(settlement)
+    await session.commit()
+
+    with pytest.raises(ValueError, match="settlement"):
+        await revert_split_transaction(session, original.id, test_workspace.id)
+
+
+@pytest.mark.asyncio
+async def test_revert_split_transaction_refuses_group_split_on_child(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    _, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    group, me, other = await _setup_group_with_settlement_target(session, test_user, test_workspace)
+    split = TransactionSplit(
+        id=uuid.uuid4(), transaction_id=children[0].id, workspace_id=test_workspace.id,
+        group_member_id=other.id, share_amount=Decimal("20.00"), share_type="exact",
+    )
+    session.add(split)
+    await session.commit()
+
+    with pytest.raises(ValueError, match="group split"):
+        await revert_split_transaction(session, original.id, test_workspace.id)
+
+
+@pytest.mark.asyncio
+async def test_revert_split_transaction_refuses_transfer_on_child(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    _, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    children[0].transfer_pair_id = uuid.uuid4()
+    await session.commit()
+
+    with pytest.raises(ValueError, match="transfer"):
+        await revert_split_transaction(session, original.id, test_workspace.id)
+
+
+# ---------------------------------------------------------------------------
+# split-into-parts guards on delete/toggle_ignore/update
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_transaction_blocks_split_parent(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    with pytest.raises(ValueError, match="split"):
+        await delete_transaction(session, original.id, test_workspace.id)
+
+
+@pytest.mark.asyncio
+async def test_delete_transaction_blocks_split_child(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    _, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    with pytest.raises(ValueError, match="split"):
+        await delete_transaction(session, children[0].id, test_workspace.id)
+
+
+@pytest.mark.asyncio
+async def test_toggle_ignore_blocks_split_parent(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    with pytest.raises(ValueError, match="split"):
+        await toggle_ignore_transaction(session, original.id, test_workspace.id)
+
+
+@pytest.mark.asyncio
+async def test_toggle_ignore_blocks_split_child(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    _, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    with pytest.raises(ValueError, match="split"):
+        await toggle_ignore_transaction(session, children[0].id, test_workspace.id)
+
+
+@pytest.mark.asyncio
+async def test_update_transaction_blocks_locked_fields_on_split_child(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    _, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    with pytest.raises(ValueError, match="split"):
+        await update_transaction(
+            session, children[0].id, test_workspace.id, test_user.id,
+            TransactionUpdate(amount=Decimal("41.00")),
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_transaction_blocks_locked_fields_on_split_parent(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    with pytest.raises(ValueError, match="split"):
+        await update_transaction(
+            session, original.id, test_workspace.id, test_user.id,
+            TransactionUpdate(date=date(2026, 6, 1)),
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_transaction_allows_free_fields_on_split_child(
+    session: AsyncSession, test_user, test_workspace, test_categories, txn_account
+):
+    """category_id/description/notes/payee stay editable on a split part."""
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    _, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    updated = await update_transaction(
+        session, children[0].id, test_workspace.id, test_user.id,
+        TransactionUpdate(description="Renamed part", category_id=test_categories[1].id, notes="a note"),
+    )
+    assert updated is not None
+    assert updated.description == "Renamed part"
+    assert updated.category_id == test_categories[1].id
+    assert updated.notes == "a note"
+
+
+@pytest.mark.asyncio
+async def test_update_transaction_resubmitting_unchanged_is_ignored_does_not_block(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    """The edit form always echoes the current is_ignored value in the save
+    payload. Resubmitting the SAME value must not trip the split guard."""
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00")
+    _, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+    child = children[0]
+    updated = await update_transaction(
+        session, child.id, test_workspace.id, test_user.id,
+        TransactionUpdate(description="Still fine", is_ignored=child.is_ignored),
+    )
+    assert updated is not None
+    assert updated.description == "Still fine"
+
+
+# ---------------------------------------------------------------------------
+# split-into-parts shielding: fuzzy match / transfer detection / P&L
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fuzzy_match_manual_excludes_split_child(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    original = await _mk_splittable_tx(
+        session, test_user, txn_account, amount="40.00", type_="debit",
+        date=date(2026, 5, 10),
+    )
+    _, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("25.00")), TransactionSplitPartInput(amount=Decimal("15.00"))],
+    )
+    child = children[0]
+    child.description = "STARBUCKS COFFEE"
+    await session.commit()
+
+    txn_data = TransactionData(
+        external_id="ext-1", description="STARBUCKS COFFEE",
+        amount=Decimal("25.00"), date=date(2026, 5, 10), type="debit",
+    )
+    match = await _fuzzy_match_manual(session, txn_account.id, txn_data)
+    assert match is None
+
+
+@pytest.mark.asyncio
+async def test_detect_transfer_pairs_excludes_ignored_parent_and_child(
+    session: AsyncSession, test_user, test_workspace, txn_account
+):
+    other_account = Account(
+        id=uuid.uuid4(), user_id=test_user.id, name="Other",
+        type="checking", balance=Decimal("0"), currency="BRL",
+    )
+    session.add(other_account)
+    await session.commit()
+
+    original = await _mk_splittable_tx(
+        session, test_user, txn_account, amount="60.00", type_="debit",
+        date=date(2026, 5, 10),
+    )
+    _, children = await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [TransactionSplitPartInput(amount=Decimal("40.00")), TransactionSplitPartInput(amount=Decimal("20.00"))],
+    )
+
+    # A same-amount, same-date credit in another account would normally
+    # pair as a transfer with either the (now-ignored) parent or a child.
+    credit_for_parent = Transaction(
+        id=uuid.uuid4(), user_id=test_user.id, account_id=other_account.id,
+        description="Would-be pair for parent", amount=Decimal("60.00"),
+        date=date(2026, 5, 10), type="credit", source="manual",
+        created_at=datetime.now(timezone.utc),
+    )
+    credit_for_child = Transaction(
+        id=uuid.uuid4(), user_id=test_user.id, account_id=other_account.id,
+        description="Would-be pair for child", amount=Decimal("40.00"),
+        date=date(2026, 5, 10), type="credit", source="manual",
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add_all([credit_for_parent, credit_for_child])
+    await session.commit()
+
+    pairs_created = await detect_transfer_pairs(session, test_workspace.id)
+    assert pairs_created == 0
+
+    await session.refresh(original)
+    for child in children:
+        await session.refresh(child)
+    assert original.transfer_pair_id is None
+    assert all(c.transfer_pair_id is None for c in children)
+    assert credit_for_parent.transfer_pair_id is None
+    assert credit_for_child.transfer_pair_id is None
+
+
+@pytest.mark.asyncio
+async def test_split_parts_pnl_counts_only_non_transfer_child(
+    session: AsyncSession, test_user, test_workspace, test_categories, txn_account
+):
+    """A split with one part in a treat_as_transfer category and one in a
+    normal category: only the normal one counts toward P&L, and the
+    original (ignored) parent counts toward neither."""
+    transfer_category = Category(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        name="Loan principal", treat_as_transfer=True,
+    )
+    session.add(transfer_category)
+    await session.commit()
+
+    original = await _mk_splittable_tx(session, test_user, txn_account, amount="60.00", type_="credit")
+    await split_transaction_into_parts(
+        session, original.id, test_workspace.id, test_user.id,
+        [
+            TransactionSplitPartInput(amount=Decimal("40.00"), category_id=transfer_category.id),
+            TransactionSplitPartInput(amount=Decimal("20.00"), category_id=test_categories[2].id),
+        ],
+    )
+
+    _, _, summary = await get_transactions(
+        session, test_workspace.id, test_user.id, include_summary=True
+    )
+    assert summary["income"] == Decimal("20.00")
+    assert summary["excluded"] == Decimal("100.00")  # 60 (ignored parent) + 40 (transfer child)

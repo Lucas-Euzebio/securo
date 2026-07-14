@@ -25,12 +25,19 @@ async def detect_transfer_pairs(
 
     Returns the number of pairs created.
     """
-    # Load candidate debits — filtered to candidate_ids when provided
+    # Load candidate debits — filtered to candidate_ids when provided.
+    # `is_ignored` excludes a divided parent (kept only for history — its
+    # amount no longer reflects real cash movement) and
+    # `parent_transaction_id.is_(None)` excludes split children (their
+    # amount is a fraction of the original, not a real transfer leg) from
+    # ever being auto-paired.
     debit_query = select(Transaction).where(
         Transaction.workspace_id == workspace_id,
         Transaction.type == "debit",
         Transaction.transfer_pair_id.is_(None),
         Transaction.source != "opening_balance",
+        Transaction.is_ignored.is_(False),
+        Transaction.parent_transaction_id.is_(None),
     )
     if candidate_ids:
         debit_query = debit_query.where(Transaction.id.in_(candidate_ids))
@@ -46,6 +53,8 @@ async def detect_transfer_pairs(
             Transaction.type == "debit",
             Transaction.transfer_pair_id.is_(None),
             Transaction.source != "opening_balance",
+            Transaction.is_ignored.is_(False),
+            Transaction.parent_transaction_id.is_(None),
             Transaction.id.not_in(candidate_ids),
         )
         reverse_result = await session.execute(reverse_debit_query)
@@ -64,6 +73,8 @@ async def detect_transfer_pairs(
         Transaction.type == "credit",
         Transaction.transfer_pair_id.is_(None),
         Transaction.source != "opening_balance",
+        Transaction.is_ignored.is_(False),
+        Transaction.parent_transaction_id.is_(None),
     )
     credit_result = await session.execute(credit_query)
     credits = list(credit_result.scalars().all())

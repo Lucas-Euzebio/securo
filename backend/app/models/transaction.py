@@ -90,6 +90,19 @@ class Transaction(Base):
         nullable=True,
         index=True,
     )
+    # Self-FK: when a bank transaction mixes two economic natures (e.g. a
+    # credit that's part loan-refund + part interest), the user splits it
+    # into N manual children, each carrying this pointer back to the
+    # original. The original stays around (flagged `is_ignored=True`) for
+    # history; only the children count for reports. ON DELETE SET NULL: the
+    # service layer blocks deleting a parent while children exist, but this
+    # keeps the schema safe even if that guard is ever bypassed.
+    parent_transaction_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("transactions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     account: Mapped["Account"] = relationship(back_populates="transactions")

@@ -23,7 +23,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog'
-import { AlertTriangle, ChevronDown, ChevronLeft, Download, Eye, EyeClosed, Paperclip, Upload, X, FileText, Plus, Unlink, SlidersHorizontal, ListPlus, Check, Link2, Users } from 'lucide-react'
+import { AlertTriangle, ChevronDown, ChevronLeft, Download, Eye, EyeClosed, Paperclip, Upload, X, FileText, Plus, Scissors, Unlink, SlidersHorizontal, ListPlus, Check, Link2, Users } from 'lucide-react'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -69,6 +69,16 @@ export function extractApiError(error: unknown): string {
     }
   }
   return 'An unexpected error occurred'
+}
+
+// Backend guard errors for split-into-parts are stable English strings
+// (e.g. "… — revert the split before changing amount, …"). Surface a
+// translated message for them instead of the raw English detail; fall
+// back to the raw detail for anything unknown.
+export function extractTxApiError(error: unknown, t: (key: string) => string): string {
+  const detail = extractApiError(error)
+  if (detail.includes('revert the split')) return t('transactions.splitPartsLockedError')
+  return detail
 }
 
 function isImageType(contentType: string): boolean {
@@ -412,14 +422,32 @@ function TransactionForm({
   const alreadyLinkedToSettlement =
     !isCreating && !!transaction && (transaction.splits ?? []).length === 0 && !!transaction.settlement_group_id
 
-  // ── Split vs. link to a settlement ──────────────────────────────
-  // A transaction's role in a group is one of three mutually exclusive
-  // states: untouched, the (new) shared expense being split, or the
-  // payment clearing an existing settlement. One piece of state owns
-  // that choice so the two checkboxes behave like a radio pair —
-  // always clickable, picking one switches off the other — rather than
-  // disabling one while the other is active.
-  const [txGroupRole, setTxGroupRole] = useState<'none' | 'split' | 'settlement'>(
+  // "Split into parts" (multi-category split, distinct from the
+  // group-expense splits above): a bank transaction that mixes two
+  // economic natures gets divided into N manual child transactions, one
+  // per category. The original becomes a read-only, ignored parent.
+  const isSplitParent = !isCreating && !!transaction && !!transaction.split_children?.length
+  const isSplitChild = !isCreating && !!transaction && !!transaction.parent_transaction_id
+  const canSplitParts =
+    !isCreating &&
+    !!transaction &&
+    (transaction.splits ?? []).length === 0 &&
+    !transaction.settlement_group_id &&
+    !transaction.parent_transaction_id &&
+    !transaction.split_children?.length &&
+    !transaction.transfer_pair_id &&
+    transaction.source !== 'settlement' &&
+    !transaction.is_ignored
+
+  // ── Split vs. link to a settlement vs. split into parts ───────────
+  // A transaction's role is one of four mutually exclusive states:
+  // untouched, the (new) shared expense being split, the payment
+  // clearing an existing settlement, or being divided into N manual
+  // parts (one per category). One piece of state owns that choice so
+  // the checkboxes behave like a radio pair — always clickable, picking
+  // one switches off the others — rather than disabling one while
+  // another is active.
+  const [txGroupRole, setTxGroupRole] = useState<'none' | 'split' | 'settlement' | 'parts'>(
     () => (splits !== null ? 'split' : 'none'),
   )
   const linkSettlementOpen = txGroupRole === 'settlement'
@@ -494,6 +522,85 @@ function TransactionForm({
     })
   }
 
+  // ── Split into parts editor state ─────────────────────────────────
+  // Each row = one child transaction (amount or percent + category +
+  // optional description). Starts with 2 empty rows; the submit button
+  // stays disabled until every part is positive and the sum matches the
+  // transaction's absolute amount (value mode) or exactly 100 (percent
+  // mode). Percent mode is UI sugar only: the payload always carries
+  // amounts, computed here with the rounding residual on the last part
+  // so the sum is exact — no backend involvement.
+  const [splitPartsMode, setSplitPartsMode] = useState<'value' | 'percent'>('value')
+  const [splitPartRows, setSplitPartRows] = useState<
+    { amount: string; percent: string; categoryId: string; description: string }[]
+  >([
+    { amount: '', percent: '', categoryId: '', description: '' },
+    { amount: '', percent: '', categoryId: '', description: '' },
+  ])
+  const splitPartsTarget = transaction ? Math.abs(Number(transaction.amount)) : 0
+  // Percent → amount per row, residual on the last so the total is exact.
+  const splitPartsComputedAmounts = useMemo(() => {
+    if (splitPartsMode !== 'percent') return null
+    let accumulated = 0
+    return splitPartRows.map((r, i) => {
+      if (i === splitPartRows.length - 1) {
+        return Math.round((splitPartsTarget - accumulated) * 100) / 100
+      }
+      const amount = Math.round(splitPartsTarget * (parseFloat(r.percent) || 0)) / 100
+      accumulated += amount
+      return amount
+    })
+  }, [splitPartsMode, splitPartRows, splitPartsTarget])
+  const splitPartsTotal =
+    splitPartsMode === 'percent'
+      ? splitPartRows.reduce((sum, r) => sum + (parseFloat(r.percent) || 0), 0)
+      : splitPartRows.reduce((sum, r) => sum + (parseFloat(r.amount) || 0), 0)
+  const splitPartsSumTarget = splitPartsMode === 'percent' ? 100 : splitPartsTarget
+  const splitPartsSumOk = Math.abs(splitPartsTotal - splitPartsSumTarget) < 0.005
+  const splitPartsValid =
+    splitPartRows.length >= 2 &&
+    splitPartsSumOk &&
+    (splitPartsMode === 'percent'
+      ? splitPartRows.every((r) => (parseFloat(r.percent) || 0) > 0) &&
+        (splitPartsComputedAmounts ?? []).every((a) => a > 0)
+      : splitPartRows.every((r) => (parseFloat(r.amount) || 0) > 0))
+
+  const splitPartsMutation = useMutation({
+    mutationFn: () => {
+      const parts = splitPartRows.map((r, i) => ({
+        amount:
+          splitPartsMode === 'percent'
+            ? (splitPartsComputedAmounts?.[i] ?? 0)
+            : parseFloat(r.amount),
+        category_id: r.categoryId || null,
+        description: r.description.trim() || null,
+      }))
+      return transactionsApi.splitParts(transaction!.id, parts)
+    },
+    onSuccess: () => {
+      toast.success(t('transactions.splitPartsSuccess'))
+      invalidateFinancialQueries(queryClient)
+      setTxGroupRole('none')
+      onIgnoreChanged?.()
+      onCancel()
+    },
+    onError: (err: unknown) => {
+      toast.error(extractTxApiError(err, t))
+    },
+  })
+
+  const revertSplitPartsMutation = useMutation({
+    mutationFn: () => transactionsApi.revertSplitParts(transaction!.id),
+    onSuccess: () => {
+      toast.success(t('transactions.splitPartsRevertSuccess'))
+      invalidateFinancialQueries(queryClient)
+      onIgnoreChanged?.()
+      onCancel()
+    },
+    onError: (err: unknown) => {
+      toast.error(extractTxApiError(err, t))
+    },
+  })
   // Privacy mode hides monetary values across the app, but the edit modal
   // surfaced the raw amount anyway (issue #323). Only existing transactions
   // carry a value worth hiding — when creating, the user must see what they
@@ -733,12 +840,16 @@ function TransactionForm({
           : hadInitialSplits
             ? { splits: { share_type: 'equal', splits: [] } }
             : {}
+        // `is_ignored` is deliberately NOT echoed here: the form never
+        // edits it (the footer toggle persists it immediately via its own
+        // endpoint), and echoing a stale snapshot broke saves on freshly
+        // split transactions — the backend guard saw a spurious "change"
+        // to a locked field.
         const txData = isSynced
           ? {
               category_id: categoryId || null,
               payee_id: payeeId || null,
               notes: notes.trim() || null,
-              is_ignored: isIgnored,
               ...overridePayload,
               ...splitsPayload,
             } as Partial<Transaction>
@@ -752,7 +863,6 @@ function TransactionForm({
               payee_id: payeeId || null,
               account_id: accountId || undefined,
               notes: notes.trim() || null,
-              is_ignored: isIgnored,
               ...fxFields,
               ...overridePayload,
               ...splitsPayload,
@@ -1088,6 +1198,18 @@ function TransactionForm({
                 {t('splitGroups.linkToSettlement')}
               </label>
             )}
+            {canSplitParts && (
+              <label className="text-sm font-medium inline-flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={txGroupRole === 'parts'}
+                  onChange={(e) => setTxGroupRole(e.target.checked ? 'parts' : 'none')}
+                  className="h-4 w-4 rounded border-border accent-primary"
+                />
+                <Scissors size={14} />
+                {t('transactions.splitIntoParts')}
+              </label>
+            )}
           </div>
 
           <TransactionSplitsSection
@@ -1168,6 +1290,165 @@ function TransactionForm({
                 )
               )}
             </div>
+          )}
+
+          {txGroupRole === 'parts' && canSplitParts && (
+            <div className="space-y-2 pl-6">
+              <div className="w-40 space-y-1">
+                <Label className="text-xs">{t('splitGroups.shareType')}</Label>
+                <select
+                  className="w-full border border-border rounded-md px-2 py-1.5 text-sm bg-background"
+                  value={splitPartsMode}
+                  onChange={(e) => setSplitPartsMode(e.target.value as 'value' | 'percent')}
+                >
+                  <option value="value">{t('splitGroups.shareExact')}</option>
+                  <option value="percent">{t('splitGroups.sharePercent')}</option>
+                </select>
+              </div>
+              {splitPartRows.map((row, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  {splitPartsMode === 'percent' ? (
+                    <>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <Input
+                          type="number"
+                          step="0.01"
+                          min="0"
+                          className="w-20 h-9 text-sm"
+                          placeholder="0"
+                          value={row.percent}
+                          onChange={(e) =>
+                            setSplitPartRows((prev) =>
+                              prev.map((r, j) => (j === i ? { ...r, percent: e.target.value } : r)),
+                            )
+                          }
+                        />
+                        <span className="text-xs text-muted-foreground">%</span>
+                      </div>
+                      {(parseFloat(row.percent) || 0) > 0 && (
+                        <span className="text-xs text-muted-foreground tabular-nums shrink-0">
+                          {(splitPartsComputedAmounts?.[i] ?? 0).toFixed(2)} {transaction?.currency ?? currency}
+                        </span>
+                      )}
+                    </>
+                  ) : (
+                    <Input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      className="w-28 h-9 text-sm shrink-0"
+                      placeholder="0.00"
+                      value={row.amount}
+                      onChange={(e) =>
+                        setSplitPartRows((prev) =>
+                          prev.map((r, j) => (j === i ? { ...r, amount: e.target.value } : r)),
+                        )
+                      }
+                    />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <CategorySelect
+                      value={row.categoryId}
+                      onChange={(next) =>
+                        setSplitPartRows((prev) =>
+                          prev.map((r, j) => (j === i ? { ...r, categoryId: next } : r)),
+                        )
+                      }
+                      categories={categories}
+                      groups={categoryGroups}
+                      allowNone={true}
+                    />
+                  </div>
+                  {splitPartRows.length > 2 && (
+                    <button
+                      type="button"
+                      className="h-9 w-9 inline-flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors shrink-0"
+                      onClick={() =>
+                        setSplitPartRows((prev) => prev.filter((_, j) => j !== i))
+                      }
+                      title={t('transactions.splitPartsRemove')}
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  )}
+                </div>
+              ))}
+              <div className="flex items-center justify-between gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="gap-1.5"
+                  disabled={splitPartRows.length >= 20}
+                  onClick={() =>
+                    setSplitPartRows((prev) => [
+                      ...prev,
+                      { amount: '', percent: '', categoryId: '', description: '' },
+                    ])
+                  }
+                >
+                  <Plus size={14} />
+                  {t('transactions.splitPartsAdd')}
+                </Button>
+                <span
+                  className={cn(
+                    'text-xs tabular-nums',
+                    splitPartsSumOk ? 'text-emerald-600' : 'text-amber-600',
+                  )}
+                >
+                  {splitPartsMode === 'percent'
+                    ? t('transactions.splitPartsSumPercent', {
+                        total: splitPartsTotal.toFixed(2),
+                      })
+                    : t('transactions.splitPartsSum', {
+                        total: splitPartsTotal.toFixed(2),
+                        target: splitPartsTarget.toFixed(2),
+                        currency: transaction?.currency ?? currency,
+                      })}
+                  {!splitPartsSumOk && (
+                    <>
+                      {' — '}
+                      {splitPartsTotal < splitPartsSumTarget
+                        ? t('transactions.splitPartsRemaining', {
+                            value:
+                              splitPartsMode === 'percent'
+                                ? `${(splitPartsSumTarget - splitPartsTotal).toFixed(2)}%`
+                                : `${(splitPartsSumTarget - splitPartsTotal).toFixed(2)} ${transaction?.currency ?? currency}`,
+                          })
+                        : t('transactions.splitPartsExceeded', {
+                            value:
+                              splitPartsMode === 'percent'
+                                ? `${(splitPartsTotal - splitPartsSumTarget).toFixed(2)}%`
+                                : `${(splitPartsTotal - splitPartsSumTarget).toFixed(2)} ${transaction?.currency ?? currency}`,
+                          })}
+                    </>
+                  )}
+                </span>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                disabled={!splitPartsValid || splitPartsMutation.isPending}
+                onClick={() => splitPartsMutation.mutate()}
+              >
+                {t('transactions.splitPartsSubmit')}
+              </Button>
+            </div>
+          )}
+
+          {isSplitParent && (
+            <p className="text-xs text-muted-foreground">
+              {t('transactions.splitPartsParentTooltip', {
+                count: transaction?.split_children?.length ?? 0,
+              })}
+            </p>
+          )}
+          {isSplitChild && (
+            <p className="text-xs text-muted-foreground">
+              {t('transactions.splitPartsChildNote', {
+                parent: transaction?.split_parent_description ?? '',
+              })}
+            </p>
           )}
 
           {alreadyLinkedToSettlement && (
@@ -1255,7 +1536,10 @@ function TransactionForm({
               {t('common.delete')}
             </Button>
           )}
-          {seed?.id && (
+          {/* A divided parent must stay ignored and a split part must stay
+              counted — the backend blocks the toggle for both, so don't
+              offer it. The parent gets a "revert split" action instead. */}
+          {seed?.id && !isSplitParent && !isSplitChild && (
             <Button
               type="button"
               variant={isIgnored ? 'secondary' : 'outline'}
@@ -1266,6 +1550,18 @@ function TransactionForm({
             >
               {isIgnored ? <Eye size={16} /> : <EyeClosed size={16} />}
               {isIgnored ? t('transactions.unignoreAction') : t('transactions.ignoreAction')}
+            </Button>
+          )}
+          {isSplitParent && (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => revertSplitPartsMutation.mutate()}
+              disabled={loading || revertSplitPartsMutation.isPending}
+              className="gap-1.5 whitespace-nowrap"
+            >
+              <Scissors size={16} />
+              {t('transactions.splitPartsRevert')}
             </Button>
           )}
           {transaction && onCreateRule && (

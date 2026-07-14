@@ -472,6 +472,16 @@ export const transactions = {
     const { data } = await api.patch(`/transactions/${id}/ignore`)
     return data
   },
+  splitParts: async (
+    id: string,
+    parts: { amount: number; category_id?: string | null; description?: string | null }[],
+  ): Promise<Transaction[]> => {
+    const { data } = await api.post(`/transactions/${id}/split-parts`, { parts })
+    return data
+  },
+  revertSplitParts: async (id: string): Promise<void> => {
+    await api.delete(`/transactions/${id}/split-parts`)
+  },
   unlinkRecurring: async (id: string): Promise<Transaction> => {
     const { data } = await api.patch(`/transactions/${id}/unlink-recurring`)
     return data

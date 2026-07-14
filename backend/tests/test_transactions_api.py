@@ -756,3 +756,58 @@ async def test_list_transactions_summary_respects_filters(
     assert summary["income"] == pytest.approx(0.0)
     assert summary["expense"] == pytest.approx(25.5)
     assert summary["net"] == pytest.approx(-25.5)
+
+
+# ---------------------------------------------------------------------------
+# split into parts — API round-trip (regression: the endpoint must serialize
+# the fresh children without lazy-loading relationships → 500 after commit)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_split_parts_endpoint_roundtrip(
+    client: AsyncClient, auth_headers, test_account: Account,
+    test_categories: list[Category], session: AsyncSession, test_user: User,
+):
+    tx = Transaction(
+        id=uuid.uuid4(), user_id=test_user.id, account_id=test_account.id,
+        description="Mixed credit", amount=Decimal("60.00"), currency="BRL",
+        date=date(2026, 5, 1), type="credit", source="manual",
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(tx)
+    await session.commit()
+
+    response = await client.post(
+        f"/api/transactions/{tx.id}/split-parts",
+        headers=auth_headers,
+        json={"parts": [
+            {"amount": "40.00", "category_id": str(test_categories[0].id)},
+            {"amount": "20.00", "category_id": str(test_categories[2].id), "description": "Interest"},
+        ]},
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert len(data) == 3  # parent + 2 children
+    parent, child_a, child_b = data
+    assert parent["id"] == str(tx.id)
+    assert parent["is_ignored"] is True
+    assert child_a["parent_transaction_id"] == str(tx.id)
+    assert child_b["parent_transaction_id"] == str(tx.id)
+    assert child_a["category_id"] == str(test_categories[0].id)
+    assert child_b["description"] == "Interest"
+    # Children serialize their (empty) splits and category without erroring
+    assert child_a["splits"] == []
+    assert child_a["category"]["id"] == str(test_categories[0].id)
+
+    # Revert round-trip
+    response = await client.delete(
+        f"/api/transactions/{tx.id}/split-parts", headers=auth_headers
+    )
+    assert response.status_code == 204
+
+    response = await client.get(
+        f"/api/transactions/{tx.id}", headers=auth_headers
+    )
+    assert response.status_code == 200
+    assert response.json()["is_ignored"] is False
