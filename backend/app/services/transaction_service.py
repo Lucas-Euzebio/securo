@@ -15,7 +15,13 @@ from app.models.bank_connection import BankConnection
 from app.models.category import Category
 from app.models.group import Group, GroupMember
 from app.models.payee import Payee
-from app.schemas.transaction import TransactionCreate, TransactionUpdate, TransferCreate
+from app.schemas.transaction import (
+    SplitChildInfo,
+    TransactionCreate,
+    TransactionSplitPartInput,
+    TransactionUpdate,
+    TransferCreate,
+)
 from app.schemas.transaction_split import TransactionSplitInput, TransactionSplitsInput
 from app.services import split_service
 from app.services.credit_card_service import apply_effective_date
@@ -468,6 +474,7 @@ async def get_transactions(
         # by `group_id`, a linked member sees the owner's transactions
         # and the frontend needs `is_shared` to lock them from edits.
         await _tag_shared_view(session, transactions, user_id)
+        await _tag_split_parts(session, transactions)
 
     return transactions, total or 0, summary
 
@@ -594,6 +601,62 @@ async def _tag_shared_view(
             # (attachment auth is owner-only). Avoid the dead-end UX
             # by not advertising files he can't open.
             tx.attachment_count = 0
+
+
+async def _tag_split_parts(
+    session: AsyncSession,
+    transactions: list[Transaction],
+) -> None:
+    """Tag "split into parts" pairs so the UI can badge both sides:
+
+    - On a divided parent: `split_children`, the list of child transactions
+      it was carved into (id/amount/description/category_id) — enough for
+      the badge tooltip to list what was created.
+    - On a child: `split_parent_description`, the parent's description, so
+      the UI can show "Part of {description}".
+
+    Batch-queries children of every parent in this page AND parents of
+    every child in this page, mirroring `_tag_shared_view`.
+    """
+    tx_ids = [tx.id for tx in transactions]
+
+    children_rows = await session.execute(
+        select(
+            Transaction.id,
+            Transaction.parent_transaction_id,
+            Transaction.amount,
+            Transaction.description,
+            Transaction.category_id,
+        ).where(Transaction.parent_transaction_id.in_(tx_ids))
+    )
+    children_by_parent: dict[uuid.UUID, list[SplitChildInfo]] = {}
+    for child_id, parent_id, amount, description, category_id in children_rows.all():
+        children_by_parent.setdefault(parent_id, []).append(
+            SplitChildInfo(
+                id=child_id,
+                amount=amount,
+                description=description,
+                category_id=category_id,
+            )
+        )
+
+    parent_ids = {tx.parent_transaction_id for tx in transactions if tx.parent_transaction_id}
+    description_by_parent: dict[uuid.UUID, str] = {}
+    if parent_ids:
+        parent_rows = await session.execute(
+            select(Transaction.id, Transaction.description).where(
+                Transaction.id.in_(parent_ids)
+            )
+        )
+        description_by_parent = {row.id: row.description for row in parent_rows.all()}
+
+    for tx in transactions:
+        tx.split_children = children_by_parent.get(tx.id)
+        tx.split_parent_description = (
+            description_by_parent.get(tx.parent_transaction_id)
+            if tx.parent_transaction_id
+            else None
+        )
 
 
 async def get_transaction(
@@ -1083,6 +1146,33 @@ async def update_transaction(
     update_data = data.model_dump(exclude_unset=True)
     apply_to_transfer_pair = update_data.pop("apply_to_transfer_pair", False)
 
+    # Split-into-parts guard: on a divided parent or one of its children,
+    # the fields that determine the amount that must sum across the group
+    # (amount, account, type, currency, date) are locked — changing any of
+    # them out from under the split would break the sum the split relies
+    # on. `is_ignored` is locked too: the edit form always echoes its
+    # current value in the save payload (not just the dedicated toggle
+    # endpoint), so this closes the same hole `toggle_ignore_transaction`
+    # guards. Only fire when the value actually changes — the form
+    # resubmitting the same is_ignored/category/etc. on every save must
+    # not block ordinary edits (description, notes, payee, category) to a
+    # split part. category_id/description/notes/payee stay free to edit.
+    _split_locked_fields = {"amount", "account_id", "type", "currency", "date", "is_ignored"}
+    _locked_changes = {
+        field
+        for field in _split_locked_fields & update_data.keys()
+        if update_data[field] != getattr(transaction, field)
+    }
+    if _locked_changes:
+        if transaction.parent_transaction_id is not None:
+            raise ValueError(
+                "This transaction is part of a split — revert the split before changing amount, account, type, currency, date or ignored status"
+            )
+        if await _has_split_children(session, transaction.id):
+            raise ValueError(
+                "This transaction is split into parts — revert the split before changing amount, account, type, currency, date or ignored status"
+            )
+
     # Splits are processed separately after column updates land so the
     # service can validate against the new amount.
     splits_payload = data.splits if "splits" in update_data else None
@@ -1380,10 +1470,24 @@ async def bulk_add_to_group(
     )
     txs = txs_result.scalars().all()
 
+    # Divided parents (split into parts) are skipped alongside transfers
+    # and already-split transactions: the parent is `is_ignored` history,
+    # not the real cash movement — the group split belongs on its children
+    # instead.
+    parent_ids_with_children = set()
+    tx_ids_in_batch = [tx.id for tx in txs]
+    if tx_ids_in_batch:
+        split_parent_rows = await session.execute(
+            select(Transaction.parent_transaction_id)
+            .where(Transaction.parent_transaction_id.in_(tx_ids_in_batch))
+            .distinct()
+        )
+        parent_ids_with_children = {row[0] for row in split_parent_rows.all()}
+
     updated = 0
     skipped = 0
     for tx in txs:
-        if tx.transfer_pair_id is not None or tx.splits:
+        if tx.transfer_pair_id is not None or tx.splits or tx.id in parent_ids_with_children:
             skipped += 1
             continue
         await split_service.replace_splits(session, tx, payload, user_id)
@@ -1408,6 +1512,18 @@ async def toggle_ignore_transaction(
     transaction = await get_transaction(session, transaction_id, workspace_id)
     if not transaction:
         return None
+    # Split-into-parts guard: a divided parent must stay ignored (un-ignoring
+    # it would double-count alongside its children) and a child must stay
+    # counted (ignoring it would silently break the sum the split relies
+    # on). Revert the split first to change either.
+    if transaction.parent_transaction_id is not None:
+        raise ValueError(
+            "This transaction is part of a split — revert the split before changing its ignored status"
+        )
+    if await _has_split_children(session, transaction.id):
+        raise ValueError(
+            "This transaction is split into parts — revert the split before changing its ignored status"
+        )
     transaction.is_ignored = not transaction.is_ignored
     await session.commit()
     await session.refresh(transaction)
@@ -1443,6 +1559,19 @@ async def delete_transaction(
     if not transaction:
         return False
 
+    # Split-into-parts guard: deleting a divided parent would strand its
+    # children's parent_transaction_id (SET NULL) with no way back, and
+    # deleting a child would break the sum the split relies on. Revert the
+    # split first in either case.
+    if transaction.parent_transaction_id is not None:
+        raise ValueError(
+            "This transaction is part of a split — revert the split before deleting it"
+        )
+    if await _has_split_children(session, transaction.id):
+        raise ValueError(
+            "This transaction is split into parts — revert the split before deleting it"
+        )
+
     # Clean up attachment files from storage before ORM cascade deletes DB records
     from app.services.attachment_service import cleanup_attachment_files
 
@@ -1468,3 +1597,222 @@ async def delete_transaction(
     await session.delete(transaction)
     await session.commit()
     return True
+
+
+async def _has_split_children(session: AsyncSession, transaction_id: uuid.UUID) -> bool:
+    """True when some transaction points at `transaction_id` as its
+    `parent_transaction_id` — i.e. `transaction_id` is a divided parent."""
+    result = await session.execute(
+        select(Transaction.id)
+        .where(Transaction.parent_transaction_id == transaction_id)
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def split_transaction_into_parts(
+    session: AsyncSession,
+    transaction_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    parts: list[TransactionSplitPartInput],
+) -> tuple[Transaction, list[Transaction]]:
+    """Materialize a transaction split into N manual child transactions.
+
+    A single bank transaction sometimes mixes two economic natures — e.g. a
+    credit that's part loan-principal refund (not income) plus part
+    interest (income) — and the app only allows one category per
+    transaction. Rather than teach every report/aggregation about
+    multi-category transactions, we create N real child transactions (each
+    with its own amount/category, summing back to the original) and flag
+    the original `is_ignored=True`. Every P&L/report/budget/cashflow
+    aggregation already excludes ignored transactions
+    (`_query_filters.counts_as_pnl`), so this is a zero-change split from
+    the reporting side — the original just stays visible in the list,
+    badged, for history.
+
+    Children are built directly (not via `create_transaction`) so
+    `apply_rules_to_transaction` never runs over the user's explicit
+    category choice.
+    """
+    from decimal import ROUND_HALF_UP
+    from app.models.group_settlement import GroupSettlement
+
+    transaction = await get_transaction(session, transaction_id, workspace_id)
+    if not transaction:
+        raise ValueError("Transaction not found")
+
+    if transaction.source == "settlement":
+        raise ValueError("Cannot split a settlement transaction")
+    if transaction.parent_transaction_id is not None:
+        raise ValueError("This transaction is already part of a split — split the parent instead")
+    if await _has_split_children(session, transaction.id):
+        raise ValueError("This transaction is already split into parts")
+    if transaction.is_ignored:
+        raise ValueError("Cannot split an already-ignored transaction")
+    if transaction.transfer_pair_id is not None:
+        raise ValueError("Cannot split a transfer leg — unlink the transfer first")
+    if transaction.splits:
+        raise ValueError("Cannot split a transaction with group splits — remove them first")
+
+    settlement_result = await session.execute(
+        select(GroupSettlement.id)
+        .where(
+            or_(
+                GroupSettlement.transaction_id == transaction.id,
+                GroupSettlement.receiver_transaction_id == transaction.id,
+            )
+        )
+        .limit(1)
+    )
+    if settlement_result.scalar_one_or_none() is not None:
+        raise ValueError(
+            "Cannot split a transaction linked to a settlement — undo the settlement link first"
+        )
+
+    if not (2 <= len(parts) <= 20):
+        raise ValueError("A split must have between 2 and 20 parts")
+
+    for part in parts:
+        if part.amount <= 0:
+            raise ValueError("Each part must have a positive amount")
+
+    total = sum((Decimal(str(part.amount)) for part in parts), Decimal("0"))
+    target = abs(Decimal(str(transaction.amount)))
+    if abs(total - target) > Decimal("0.005"):
+        raise ValueError("The parts must add up to the transaction's amount")
+
+    parent_amount = Decimal(str(transaction.amount))
+    parent_primary = transaction.amount_primary
+    accumulated_primary = Decimal("0")
+    last_index = len(parts) - 1
+
+    children: list[Transaction] = []
+    for i, part in enumerate(parts):
+        child = Transaction(
+            user_id=transaction.user_id,
+            workspace_id=transaction.workspace_id,
+            account_id=transaction.account_id,
+            date=transaction.date,
+            effective_date=transaction.effective_date,
+            type=transaction.type,
+            currency=transaction.currency,
+            payee=transaction.payee,
+            payee_id=transaction.payee_id,
+            status=transaction.status,
+            notes=transaction.notes,
+            bill_id=transaction.bill_id,
+            effective_bill_date=transaction.effective_bill_date,
+            source="manual",
+            parent_transaction_id=transaction.id,
+            description=(part.description or transaction.description),
+            amount=Decimal(str(part.amount)),
+            category_id=part.category_id,
+        )
+        if parent_primary is not None:
+            if i == last_index:
+                child.amount_primary = parent_primary - accumulated_primary
+            else:
+                child_primary = (
+                    parent_primary * (Decimal(str(part.amount)) / parent_amount)
+                ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                accumulated_primary += child_primary
+                child.amount_primary = child_primary
+            child.fx_rate_used = transaction.fx_rate_used
+        else:
+            child.amount_primary = None
+            child.fx_rate_used = None
+        session.add(child)
+        children.append(child)
+
+    transaction.is_ignored = True
+    await session.flush()
+    child_ids = [child.id for child in children]
+    await session.commit()
+
+    # Re-load parent and children with the relationships TransactionRead
+    # serializes (category, splits, payee_entity) eagerly loaded. A bare
+    # refresh leaves the fresh child objects' relationships unloaded, and
+    # the endpoint's model_validate would then trigger a lazy load outside
+    # the async greenlet — a 500 *after* the split already committed (the
+    # dialog showed an error while the split silently existed).
+    refreshed_parent = await get_transaction(session, transaction.id, workspace_id)
+    assert refreshed_parent is not None
+    children_result = await session.execute(
+        select(Transaction)
+        .where(Transaction.parent_transaction_id == transaction.id)
+        .options(
+            selectinload(Transaction.category),
+            selectinload(Transaction.splits),
+            selectinload(Transaction.payee_entity),
+        )
+    )
+    by_id = {child.id: child for child in children_result.scalars().all()}
+    # Preserve the caller's part order (the insert order).
+    refreshed_children = [by_id[cid] for cid in child_ids if cid in by_id]
+    return refreshed_parent, refreshed_children
+
+
+async def revert_split_transaction(
+    session: AsyncSession,
+    transaction_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+) -> Transaction:
+    """Undo `split_transaction_into_parts`: delete the child transactions and
+    un-ignore the parent, restoring the original single-transaction view.
+
+    Refuses when a child has since been adopted by another subsystem
+    (settlement, group split, transfer pairing) — the user must undo that
+    link on the child first, since deleting it out from under a
+    settlement/transfer would corrupt that other record.
+    """
+    from app.models.group_settlement import GroupSettlement
+    from app.services.attachment_service import cleanup_attachment_files
+
+    transaction = await get_transaction(session, transaction_id, workspace_id)
+    if not transaction:
+        raise ValueError("Transaction not found")
+
+    # populate_existing: the children may already sit in this session's
+    # identity map with a stale (empty) `splits` collection — the session
+    # runs with expire_on_commit=False, so without it the guard below
+    # would check the snapshot instead of DB truth.
+    children_result = await session.execute(
+        select(Transaction)
+        .where(Transaction.parent_transaction_id == transaction.id)
+        .options(selectinload(Transaction.splits))
+        .execution_options(populate_existing=True)
+    )
+    children = list(children_result.scalars().all())
+    if not children:
+        raise ValueError("This transaction is not split into parts")
+
+    child_ids = [child.id for child in children]
+    settlement_result = await session.execute(
+        select(GroupSettlement.id)
+        .where(
+            or_(
+                GroupSettlement.transaction_id.in_(child_ids),
+                GroupSettlement.receiver_transaction_id.in_(child_ids),
+            )
+        )
+        .limit(1)
+    )
+    if settlement_result.scalar_one_or_none() is not None:
+        raise ValueError("Undo the settlement link on the split parts before reverting")
+
+    for child in children:
+        if child.splits:
+            raise ValueError("Undo the group split on the split parts before reverting")
+        if child.transfer_pair_id is not None:
+            raise ValueError("Undo the transfer link on the split parts before reverting")
+
+    await cleanup_attachment_files(session, child_ids)
+
+    for child in children:
+        await session.delete(child)
+
+    transaction.is_ignored = False
+    await session.commit()
+    await session.refresh(transaction)
+    return transaction
