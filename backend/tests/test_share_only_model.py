@@ -38,6 +38,7 @@ from app.services import (
     group_service,
     settlement_service,
     split_service,
+    transaction_service,
 )
 
 
@@ -639,3 +640,47 @@ async def test_budget_actual_uses_share_only(
     food_row = next(r for r in rows if r.category_id == food.id)
     # Owner's share is $20 (60/3); the full $60 would be the bug.
     assert float(food_row.actual_amount) == pytest.approx(20.0, abs=0.01)
+
+
+# ────────── settlement-linked transactions get a group badge too ──────────
+
+
+@pytest.mark.asyncio
+async def test_settlement_linked_transactions_tagged_with_group(
+    session: AsyncSession, test_user, test_workspace
+):
+    """A transaction that backs a settlement leg (either side) should be
+    tagged with `settlement_group_id` even though it has no splits of its
+    own — this is what lets the UI show a group badge on the payoff, not
+    just on the original shared expense."""
+    account = await _make_account(session, test_user.id)
+    group, (me, friend) = await _setup_group(session, test_user, test_workspace.id, "Me", "Friend")
+
+    payer_tx = await _make_tx(session, test_user.id, account.id, "20.00")
+    receiver_tx = await _make_tx(session, test_user.id, account.id, "15.00", type_="credit")
+    unrelated_tx = await _make_tx(session, test_user.id, account.id, "5.00")
+
+    await settlement_service.create_settlement(
+        session, group.id, test_workspace.id, test_user.id,
+        GroupSettlementCreate(
+            from_member_id=me.id, to_member_id=friend.id,
+            amount=Decimal("20.00"), currency="USD", date=date.today(),
+            transaction_id=payer_tx.id,
+        ),
+    )
+    await settlement_service.create_settlement(
+        session, group.id, test_workspace.id, test_user.id,
+        GroupSettlementCreate(
+            from_member_id=friend.id, to_member_id=me.id,
+            amount=Decimal("15.00"), currency="USD", date=date.today(),
+            receiver_transaction_id=receiver_tx.id,
+        ),
+    )
+
+    transactions, _total, _summary = await transaction_service.get_transactions(
+        session, test_workspace.id, test_user.id, skip_pagination=True
+    )
+    by_id = {tx.id: tx for tx in transactions}
+    assert by_id[payer_tx.id].settlement_group_id == group.id
+    assert by_id[receiver_tx.id].settlement_group_id == group.id
+    assert by_id[unrelated_tx.id].settlement_group_id is None

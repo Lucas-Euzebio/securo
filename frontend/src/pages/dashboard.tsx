@@ -418,6 +418,10 @@ export default function DashboardPage() {
     groupId: string | null
     parentOwnerName: string | null
     groupName: string | null
+    // Set when the transaction backs a settlement leg — distinct from
+    // groupId/groupName above, which only cover the original split.
+    settlementGroupId: string | null
+    settlementGroupName: string | null
     isIgnored: boolean
   }
 
@@ -465,6 +469,10 @@ export default function DashboardPage() {
         groupId,
         parentOwnerName: isShared ? tx.parent_owner_name ?? null : null,
         groupName: groupId ? groupNameById.get(groupId) ?? null : null,
+        settlementGroupId: tx.settlement_group_id ?? null,
+        settlementGroupName: tx.settlement_group_id
+          ? groupNameById.get(tx.settlement_group_id) ?? null
+          : null,
         isIgnored: tx.is_ignored
       })
     }
@@ -489,6 +497,8 @@ export default function DashboardPage() {
         groupId: null,
         parentOwnerName: null,
         groupName: null,
+        settlementGroupId: null,
+        settlementGroupName: null,
         isIgnored: pt.is_ignored
       })
     }
@@ -1092,6 +1102,13 @@ export default function DashboardPage() {
                                   {row.isShared && row.parentOwnerName
                                     ? t('splitGroups.sharedShortBadgeAuthor', { author: row.parentOwnerName })
                                     : row.groupName ?? t('splitGroups.sharedShortBadge')}
+                                </span>
+                              )}
+                              {!row.groupId && row.settlementGroupId && (
+                                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-violet-100 text-violet-700 dark:bg-violet-950/40 dark:text-violet-300 shrink-0 uppercase tracking-wide">
+                                  {t('splitGroups.settlementRowBadge', {
+                                    group: row.settlementGroupName ?? '',
+                                  })}
                                 </span>
                               )}
                               {row.isProjected && (

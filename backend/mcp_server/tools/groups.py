@@ -172,6 +172,7 @@ async def list_group_settlements(
             "date": s.date.isoformat() if s.date else None,
             "notes": getattr(s, "notes", None),
             "transaction_id": str(s.transaction_id) if getattr(s, "transaction_id", None) else None,
+            "receiver_transaction_id": str(s.receiver_transaction_id) if getattr(s, "receiver_transaction_id", None) else None,
         }
         for s in rows
     ]

@@ -468,6 +468,7 @@ async def get_transactions(
         # by `group_id`, a linked member sees the owner's transactions
         # and the frontend needs `is_shared` to lock them from edits.
         await _tag_shared_view(session, transactions, user_id)
+        await _tag_settlement_links(session, transactions)
 
     return transactions, total or 0, summary
 
@@ -594,6 +595,45 @@ async def _tag_shared_view(
             # (attachment auth is owner-only). Avoid the dead-end UX
             # by not advertising files he can't open.
             tx.attachment_count = 0
+
+
+async def _tag_settlement_links(
+    session: AsyncSession,
+    transactions: list[Transaction],
+) -> None:
+    """Tag transactions that back a settlement leg — either the payer's
+    `transaction_id` or the receiver's `receiver_transaction_id` on some
+    `GroupSettlement` — with that settlement's group.
+
+    This is distinct from `_tag_shared_view`'s `group_id`: that one only
+    covers the *original* shared expense (via `TransactionSplit`). A
+    transaction linked as a settlement's payoff usually has no splits of
+    its own, so without this it shows no group badge at all even though
+    it's clearly tied to the group.
+    """
+    from app.models.group_settlement import GroupSettlement
+
+    tx_ids = [tx.id for tx in transactions]
+    rows = await session.execute(
+        select(
+            GroupSettlement.transaction_id,
+            GroupSettlement.receiver_transaction_id,
+            GroupSettlement.group_id,
+        ).where(
+            or_(
+                GroupSettlement.transaction_id.in_(tx_ids),
+                GroupSettlement.receiver_transaction_id.in_(tx_ids),
+            )
+        )
+    )
+    group_by_tx: dict[uuid.UUID, uuid.UUID] = {}
+    for payer_tx_id, receiver_tx_id, group_id in rows.all():
+        if payer_tx_id is not None:
+            group_by_tx[payer_tx_id] = group_id
+        if receiver_tx_id is not None:
+            group_by_tx[receiver_tx_id] = group_id
+    for tx in transactions:
+        tx.settlement_group_id = group_by_tx.get(tx.id)
 
 
 async def get_transaction(

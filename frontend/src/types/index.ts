@@ -230,6 +230,10 @@ export interface Transaction {
   // Display name of the parent's owner (the person who actually paid).
   // Derived per-request from the group's `is_self` member.
   parent_owner_name?: string | null
+  // Set when this transaction backs a settlement leg (payer's or
+  // receiver's side) — distinct from `group_id` above, which only
+  // covers the original shared expense.
+  settlement_group_id?: string | null
   // Flag to exclude this transaction from reports and dashboard aggregations
   is_ignored: boolean
 }
@@ -297,6 +301,7 @@ export interface GroupSettlement {
   currency: string
   date: string
   transaction_id: string | null
+  receiver_transaction_id: string | null
   notes: string | null
   created_at: string
 }

@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account
@@ -109,6 +109,18 @@ async def _create_payment_transaction(
     return tx
 
 
+def _user_workspace_ids(user_id: uuid.UUID):
+    """Subquery of every workspace the given user belongs to. Shared by
+    the receiver-account lookup and the receiver-transaction validation —
+    both need to reach across workspaces because the receiver may sit in
+    a different workspace than the one the settlement was recorded in."""
+    from app.models.workspace import WorkspaceMember
+
+    return select(WorkspaceMember.workspace_id).where(
+        WorkspaceMember.user_id == user_id
+    )
+
+
 async def _pick_default_account_for_user(
     session: AsyncSession, user_id: uuid.UUID
 ) -> Optional[Account]:
@@ -116,17 +128,10 @@ async def _pick_default_account_for_user(
     across any workspace they belong to. Used as the auto-target for
     receiver-side settlement credits — the receiver may sit in a
     different workspace than where the settlement was recorded."""
-    from app.models.workspace import WorkspaceMember
-
-    # Resolve the workspaces the user can write to. Pick the first
-    # account that lives in any of them; ties broken by name.
-    user_workspaces_subq = select(WorkspaceMember.workspace_id).where(
-        WorkspaceMember.user_id == user_id
-    )
     result = await session.execute(
         select(Account)
         .where(
-            Account.workspace_id.in_(user_workspaces_subq),
+            Account.workspace_id.in_(_user_workspace_ids(user_id)),
             Account.is_closed.is_(False),
             Account.type.in_(("checking", "savings")),
         )
@@ -206,6 +211,69 @@ async def _validate_transaction(
         raise ValueError("Linked transaction not found")
 
 
+async def _validate_receiver_transaction(
+    session: AsyncSession,
+    receiver_transaction_id: Optional[uuid.UUID],
+    receiver_user_id: Optional[uuid.UUID],
+) -> None:
+    """Validate a receiver-side transaction link. Unlike the payer's
+    `_validate_transaction`, this checks the transaction against every
+    workspace the *receiver* belongs to, not the caller's workspace — the
+    receiver may sit in a different workspace (same reasoning as
+    `_pick_default_account_for_user`).
+
+    Note: a linked existing transaction keeps its original `source` (e.g.
+    "sync"), so it won't be excluded from P&L the way an auto-created
+    settlement transaction is (see `counts_as_pnl`/`counts_as_user_pnl` in
+    _query_filters.py, which key off `source == "settlement"`). This is
+    the same known gap that already exists for the payer's `transaction_id`
+    — accepted here rather than fixed, since correcting it means reworking
+    report queries.
+    """
+    if receiver_transaction_id is None:
+        return
+    if receiver_user_id is None:
+        raise ValueError(
+            "Cannot link a receiver transaction: receiver has no resolvable Securo user"
+        )
+    result = await session.execute(
+        select(Transaction).where(
+            Transaction.id == receiver_transaction_id,
+            Transaction.workspace_id.in_(_user_workspace_ids(receiver_user_id)),
+        )
+    )
+    if result.scalar_one_or_none() is None:
+        raise ValueError("Linked transaction not found")
+
+
+async def _assert_transaction_available(
+    session: AsyncSession,
+    transaction_id: Optional[uuid.UUID],
+    exclude_settlement_id: Optional[uuid.UUID] = None,
+) -> None:
+    """A transaction can back at most one settlement leg (either as the
+    payer's `transaction_id` or the receiver's `receiver_transaction_id`
+    of *any* settlement, including the same one) — otherwise the same
+    real money movement would silently offset multiple debts, e.g. when
+    recording several installment repayments and accidentally picking
+    the same incoming transaction twice."""
+    if transaction_id is None:
+        return
+    query = select(GroupSettlement.id).where(
+        or_(
+            GroupSettlement.transaction_id == transaction_id,
+            GroupSettlement.receiver_transaction_id == transaction_id,
+        )
+    )
+    if exclude_settlement_id is not None:
+        query = query.where(GroupSettlement.id != exclude_settlement_id)
+    result = await session.execute(query)
+    if result.scalar_one_or_none() is not None:
+        raise ValueError(
+            "This transaction is already linked to another settlement"
+        )
+
+
 async def list_settlements(
     session: AsyncSession,
     group_id: uuid.UUID,
@@ -243,10 +311,23 @@ async def create_settlement(
         session, group_id, [data.from_member_id, data.to_member_id]
     )
     await _validate_transaction(session, data.transaction_id, workspace_id)
+    await _assert_transaction_available(session, data.transaction_id)
 
     payload = data.model_dump()
     account_id = payload.pop("account_id", None)
     description = payload.pop("description", None)
+    skip_receiver_transaction = payload.pop("skip_receiver_transaction", False)
+    receiver_transaction_id = payload.get("receiver_transaction_id")
+
+    if receiver_transaction_id is not None and skip_receiver_transaction:
+        raise ValueError(
+            "Pass either receiver_transaction_id (to link an existing "
+            "transaction) or skip_receiver_transaction (to skip it), not both"
+        )
+    if receiver_transaction_id is not None and receiver_transaction_id == data.transaction_id:
+        raise ValueError(
+            "A settlement cannot use the same transaction for both sides"
+        )
 
     # Resolve member metadata once — we need names for descriptions
     # and the to_member's linked_user_id for the receiver-side credit.
@@ -292,11 +373,18 @@ async def create_settlement(
         )
         payload["transaction_id"] = tx.id
 
-    # Receiver-side mirror credit: when the receiver maps to a Securo
-    # user and has a checking/savings account, record the cash-in side
-    # so their books reflect the actual money received.
-    receiver_tx_id = None
-    if receiver_user_id is not None:
+    # Receiver-side: either link an existing credit transaction, skip it
+    # entirely, or (default, unchanged) auto-create a mirror credit when
+    # the receiver maps to a Securo user with a checking/savings account.
+    if receiver_transaction_id is not None:
+        await _validate_receiver_transaction(
+            session, receiver_transaction_id, receiver_user_id
+        )
+        await _assert_transaction_available(session, receiver_transaction_id)
+        receiver_tx_id = receiver_transaction_id
+    elif skip_receiver_transaction:
+        receiver_tx_id = None
+    elif receiver_user_id is not None:
         receiver_desc = description or f"Acerto · {group.name} · {from_name}"
         receiver_tx = await _create_receiver_credit(
             session,
@@ -306,8 +394,9 @@ async def create_settlement(
             data.date,
             receiver_desc,
         )
-        if receiver_tx is not None:
-            receiver_tx_id = receiver_tx.id
+        receiver_tx_id = receiver_tx.id if receiver_tx is not None else None
+    else:
+        receiver_tx_id = None
     payload["receiver_transaction_id"] = receiver_tx_id
 
     settlement = GroupSettlement(
@@ -363,6 +452,28 @@ async def update_settlement(
 
     if "transaction_id" in update_data:
         await _validate_transaction(session, update_data["transaction_id"], workspace_id)
+        await _assert_transaction_available(
+            session, update_data["transaction_id"], exclude_settlement_id=settlement.id
+        )
+
+    if "receiver_transaction_id" in update_data:
+        to_meta_result = await session.execute(
+            select(GroupMember.linked_user_id, GroupMember.is_self).where(
+                GroupMember.id == new_to
+            )
+        )
+        to_meta = to_meta_result.one_or_none()
+        receiver_user_id = None
+        if to_meta is not None:
+            receiver_user_id = to_meta.linked_user_id
+            if receiver_user_id is None and to_meta.is_self:
+                receiver_user_id = group.user_id
+        await _validate_receiver_transaction(
+            session, update_data["receiver_transaction_id"], receiver_user_id
+        )
+        await _assert_transaction_available(
+            session, update_data["receiver_transaction_id"], exclude_settlement_id=settlement.id
+        )
 
     for key, value in update_data.items():
         setattr(settlement, key, value)

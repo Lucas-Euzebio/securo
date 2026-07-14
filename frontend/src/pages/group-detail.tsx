@@ -195,6 +195,19 @@ export default function GroupDetailPage() {
     enabled: !!groupId,
   })
 
+  // Transactions already backing a settlement leg (either side, any
+  // settlement) — excluded from the "link existing transaction" pickers
+  // below so the same real money movement can't be linked twice (e.g.
+  // when recording several installment repayments).
+  const settledTransactionIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const s of settlements ?? []) {
+      if (s.transaction_id) ids.add(s.transaction_id)
+      if (s.receiver_transaction_id) ids.add(s.receiver_transaction_id)
+    }
+    return ids
+  }, [settlements])
+
   const { data: groupTxs } = useQuery({
     queryKey: ['groups', groupId, 'transactions'],
     queryFn: () => groupsApi.transactions(groupId, 20),
@@ -301,6 +314,14 @@ export default function GroupDetailPage() {
   const [settlePickedTx, setSettlePickedTx] = useState<Transaction | null>(null)
   const [settleTxSearch, setSettleTxSearch] = useState('')
   const [settleTxQuery, setSettleTxQuery] = useState('')
+  // Mirrors the payer's tx-action state for the receiver side: 'auto'
+  // keeps the current default (backend auto-creates a mirror credit),
+  // 'existing' links a credit transaction the receiver already has,
+  // 'none' skips the receiver-side ledger entirely.
+  const [settleReceiverTxMode, setSettleReceiverTxMode] = useState<'auto' | 'existing' | 'none'>('auto')
+  const [settleReceiverPickedTx, setSettleReceiverPickedTx] = useState<Transaction | null>(null)
+  const [settleReceiverTxSearch, setSettleReceiverTxSearch] = useState('')
+  const [settleReceiverTxQuery, setSettleReceiverTxQuery] = useState('')
 
   // Accounts of the requesting user — needed only when the optional
   // "create transaction" toggle is enabled.
@@ -317,6 +338,11 @@ export default function GroupDetailPage() {
     return () => clearTimeout(id)
   }, [settleTxSearch])
 
+  useEffect(() => {
+    const id = setTimeout(() => setSettleReceiverTxQuery(settleReceiverTxSearch), 300)
+    return () => clearTimeout(id)
+  }, [settleReceiverTxSearch])
+
   // The payer's debit transactions, searched server-side and capped —
   // offered when linking an existing transaction instead of creating one.
   const { data: settleTxOptions } = useQuery({
@@ -330,6 +356,22 @@ export default function GroupDetailPage() {
         sort_dir: 'desc',
       }),
     enabled: settleOpen && settleTxMode === 'existing',
+  })
+
+  // Mirror of settleTxOptions for the receiver side — credit
+  // transactions instead of debit, offered when linking an existing
+  // incoming transaction instead of letting the backend auto-create one.
+  const { data: settleReceiverTxOptions } = useQuery({
+    queryKey: ['settle-receiver-tx-options', settleReceiverTxQuery],
+    queryFn: () =>
+      transactionsApi.list({
+        type: 'credit',
+        q: settleReceiverTxQuery || undefined,
+        limit: 20,
+        sort_by: 'date',
+        sort_dir: 'desc',
+      }),
+    enabled: settleOpen && settleReceiverTxMode === 'existing',
   })
 
   const settlementMutation = useMutation({
@@ -379,8 +421,19 @@ export default function GroupDetailPage() {
     setSettlePickedTx(null)
     setSettleTxSearch('')
     setSettleTxQuery('')
+    setSettleReceiverTxMode('auto')
+    setSettleReceiverPickedTx(null)
+    setSettleReceiverTxSearch('')
+    setSettleReceiverTxQuery('')
     setSettleOpen(true)
   }
+
+  // Who the current viewer is within this settlement, reused by both the
+  // dialog render (to decide which tx-action selector to show) and
+  // saveSettlement (to decide which ledger fields it's allowed to set).
+  const settleMyMemberId = viewerMember?.id ?? (isOwner ? ownerMember?.id : null)
+  const settleViewerIsPayer = !!settleMyMemberId && settleFrom === settleMyMemberId
+  const settleViewerIsReceiver = !!settleMyMemberId && settleTo === settleMyMemberId
 
   const saveSettlement = () => {
     if (!settleFrom || !settleTo || !settleAmount) return
@@ -392,10 +445,19 @@ export default function GroupDetailPage() {
       date: settleDate,
       notes: settleNotes.trim() || null,
     }
-    if (settleTxMode === 'create' && settleAccountId) {
+    // Only the payer's own ledger fields are set from the payer block —
+    // mirrored below for the receiver block — matching who is actually
+    // authorized to influence each side (`_can_settle_from` only checks
+    // the payer; the owner can always act on either side).
+    if ((isOwner || settleViewerIsPayer) && settleTxMode === 'create' && settleAccountId) {
       payload.account_id = settleAccountId
-    } else if (settleTxMode === 'existing' && settlePickedTx) {
+    } else if ((isOwner || settleViewerIsPayer) && settleTxMode === 'existing' && settlePickedTx) {
       payload.transaction_id = settlePickedTx.id
+    }
+    if ((isOwner || settleViewerIsReceiver) && settleReceiverTxMode === 'existing' && settleReceiverPickedTx) {
+      payload.receiver_transaction_id = settleReceiverPickedTx.id
+    } else if ((isOwner || settleViewerIsReceiver) && settleReceiverTxMode === 'none') {
+      payload.skip_receiver_transaction = true
     }
     settlementMutation.mutate(payload)
   }
@@ -1000,8 +1062,15 @@ export default function GroupDetailPage() {
             <DialogTitle>{t('splitGroups.recordSettlement')}</DialogTitle>
           </DialogHeader>
           {(() => {
-            const myMemberId = viewerMember?.id ?? (isOwner ? ownerMember?.id : null)
-            const viewerIsPayer = !!myMemberId && settleFrom === myMemberId
+            // Never offer a transaction that already backs another
+            // settlement leg — picking it here would silently double-
+            // offset the same real money movement.
+            const availableTxOptions = (settleTxOptions?.items ?? []).filter(
+              (tx) => !settledTransactionIds.has(tx.id),
+            )
+            const availableReceiverTxOptions = (settleReceiverTxOptions?.items ?? []).filter(
+              (tx) => !settledTransactionIds.has(tx.id),
+            )
             return (
           <div className="space-y-4 min-w-0">
             <div className="space-y-2">
@@ -1032,7 +1101,14 @@ export default function GroupDetailPage() {
               <select
                 className="w-full border border-border rounded-md px-3 py-2 text-sm bg-background"
                 value={settleTo}
-                onChange={(e) => setSettleTo(e.target.value)}
+                onChange={(e) => {
+                  setSettleTo(e.target.value)
+                  // Reset the receiver-side ledger options: only
+                  // meaningful when the viewer is the receiver.
+                  setSettleReceiverTxMode('auto')
+                  setSettleReceiverPickedTx(null)
+                  setSettleReceiverTxSearch('')
+                }}
               >
                 <option value="">{t('splitGroups.selectMember')}</option>
                 {group.members.map((m) => (
@@ -1047,7 +1123,7 @@ export default function GroupDetailPage() {
                 will back this settlement. When linking an existing
                 transaction, the amount/currency/date below mirror that
                 transaction and lock so the two records can't disagree. */}
-            {viewerIsPayer && (
+            {settleViewerIsPayer && (
                 <div className="space-y-2">
                   <Label>{t('splitGroups.txAction')}</Label>
                   <select
@@ -1092,12 +1168,12 @@ export default function GroupDetailPage() {
                         placeholder={t('splitGroups.searchTransaction')}
                       />
                       <div className="max-h-44 overflow-y-auto rounded-md border border-border divide-y divide-border">
-                        {(settleTxOptions?.items ?? []).length === 0 ? (
+                        {availableTxOptions.length === 0 ? (
                           <p className="text-xs text-muted-foreground px-3 py-4 text-center">
                             {t('splitGroups.noTransactions')}
                           </p>
                         ) : (
-                          (settleTxOptions?.items ?? []).map((tx) => {
+                          availableTxOptions.map((tx) => {
                             const picked = settlePickedTx?.id === tx.id
                             return (
                               <button
@@ -1138,6 +1214,79 @@ export default function GroupDetailPage() {
                   )}
                 </div>
             )}
+            {/* Mirrors the payer block above for the receiver side. The
+                default ('auto') keeps today's behavior: the backend
+                auto-creates a mirror credit. 'existing' links a credit
+                transaction the receiver already has (e.g. a synced
+                bank deposit) instead of creating a duplicate. */}
+            {settleViewerIsReceiver && (
+                <div className="space-y-2">
+                  <Label>{t('splitGroups.receiverTxAction')}</Label>
+                  <select
+                    className="w-full border border-border rounded-md px-3 py-2 text-sm bg-background"
+                    value={settleReceiverTxMode}
+                    onChange={(e) => {
+                      setSettleReceiverTxMode(e.target.value as 'auto' | 'existing' | 'none')
+                      setSettleReceiverPickedTx(null)
+                      setSettleReceiverTxSearch('')
+                    }}
+                  >
+                    <option value="auto">{t('splitGroups.receiverTxActionAuto')}</option>
+                    <option value="existing">{t('splitGroups.txActionExisting')}</option>
+                    <option value="none">{t('splitGroups.txActionNone')}</option>
+                  </select>
+                  {settleReceiverTxMode === 'existing' && (
+                    <div className="space-y-1.5">
+                      <Input
+                        type="text"
+                        value={settleReceiverTxSearch}
+                        onChange={(e) => setSettleReceiverTxSearch(e.target.value)}
+                        placeholder={t('splitGroups.searchTransaction')}
+                      />
+                      <div className="max-h-44 overflow-y-auto rounded-md border border-border divide-y divide-border">
+                        {availableReceiverTxOptions.length === 0 ? (
+                          <p className="text-xs text-muted-foreground px-3 py-4 text-center">
+                            {t('splitGroups.noTransactions')}
+                          </p>
+                        ) : (
+                          availableReceiverTxOptions.map((tx) => {
+                            const picked = settleReceiverPickedTx?.id === tx.id
+                            return (
+                              <button
+                                key={tx.id}
+                                type="button"
+                                onClick={() => {
+                                  setSettleReceiverPickedTx(tx)
+                                  setSettleAmount(Number(tx.amount).toFixed(2))
+                                  setSettleCurrency(tx.currency)
+                                  setSettleDate(tx.date)
+                                }}
+                                className={`w-full text-left px-3 py-2 text-sm flex items-center justify-between gap-3 ${
+                                  picked ? 'bg-primary/10' : 'hover:bg-muted/50'
+                                }`}
+                              >
+                                <span className="min-w-0 truncate">
+                                  <span className="text-muted-foreground">{tx.date}</span> ·{' '}
+                                  {tx.description}
+                                </span>
+                                <span className="shrink-0 tabular-nums text-muted-foreground">
+                                  {tx.amount} {tx.currency}
+                                </span>
+                              </button>
+                            )
+                          })
+                        )}
+                      </div>
+                      {settleReceiverPickedTx && (
+                        <p className="text-xs text-muted-foreground truncate">
+                          {t('splitGroups.selectedTransaction')}: {settleReceiverPickedTx.date} ·{' '}
+                          {settleReceiverPickedTx.description}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+            )}
             <div className="grid grid-cols-3 gap-3">
               <div className="space-y-2 col-span-2">
                 <Label>{t('splitGroups.amount')}</Label>
@@ -1146,7 +1295,7 @@ export default function GroupDetailPage() {
                   step="0.01"
                   value={settleAmount}
                   onChange={(e) => setSettleAmount(e.target.value)}
-                  disabled={settleTxMode === 'existing'}
+                  disabled={settleTxMode === 'existing' || settleReceiverTxMode === 'existing'}
                 />
               </div>
               <div className="space-y-2">
@@ -1155,7 +1304,7 @@ export default function GroupDetailPage() {
                   value={settleCurrency}
                   maxLength={3}
                   onChange={(e) => setSettleCurrency(e.target.value.toUpperCase())}
-                  disabled={settleTxMode === 'existing'}
+                  disabled={settleTxMode === 'existing' || settleReceiverTxMode === 'existing'}
                 />
               </div>
             </div>
@@ -1165,7 +1314,7 @@ export default function GroupDetailPage() {
                 value={settleDate}
                 onChange={setSettleDate}
                 className="w-full justify-start"
-                disabled={settleTxMode === 'existing'}
+                disabled={settleTxMode === 'existing' || settleReceiverTxMode === 'existing'}
               />
             </div>
             <div className="space-y-2">
@@ -1193,6 +1342,7 @@ export default function GroupDetailPage() {
                 !settleAmount ||
                 (settleTxMode === 'create' && !settleAccountId) ||
                 (settleTxMode === 'existing' && !settlePickedTx) ||
+                (settleReceiverTxMode === 'existing' && !settleReceiverPickedTx) ||
                 settlementMutation.isPending
               }
             >

@@ -95,6 +95,12 @@ class TransactionRead(TransactionBase):
     # is_self member at request time. Helps the UI show who paid
     # instead of a generic "shared" badge.
     parent_owner_name: Optional[str] = None
+    # Set when this transaction backs a settlement leg (payer's
+    # transaction_id or receiver's receiver_transaction_id) — distinct
+    # from `group_id` above, which only covers the original shared
+    # expense. Lets the UI badge a settlement payoff even though it has
+    # no splits of its own.
+    settlement_group_id: Optional[uuid.UUID] = None
     is_ignored: bool = False
 
     model_config = ConfigDict(from_attributes=True)
