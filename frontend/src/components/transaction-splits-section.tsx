@@ -2,7 +2,6 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useDisplayLocale } from '@/hooks/use-display-locale'
 import { useQuery } from '@tanstack/react-query'
-import { Users } from 'lucide-react'
 
 import { groups as groupsApi } from '@/lib/api'
 import { formatCurrency } from '@/lib/format'
@@ -50,16 +49,21 @@ export function TransactionSplitsSection({
   value,
   onChange,
   onValidityChange,
+  enabled,
 }: {
   amount: number
   currency: string
   value: TransactionSplitsInput | null
   onChange: (next: TransactionSplitsInput | null) => void
   onValidityChange?: (valid: boolean) => void
+  // Controlled by the parent dialog: it owns the single choice between
+  // this and "link to a settlement" (mutually exclusive — a transaction
+  // can't be both a new shared expense and the payment clearing an
+  // existing one) and renders both toggles itself.
+  enabled: boolean
 }) {
   const { t } = useTranslation()
   const locale = useDisplayLocale()
-  const [enabled, setEnabled] = useState(value !== null)
   const [groupId, setGroupId] = useState<string>('')
   const [shareType, setShareType] = useState<ShareType>(value?.share_type ?? 'equal')
   const [rows, setRows] = useState<RowState[]>([])
@@ -179,20 +183,9 @@ export function TransactionSplitsSection({
     setRows((prev) => prev.map((r) => (r.member_id === memberId ? { ...r, ...patch } : r)))
   }
 
-  return (
-    <div className="space-y-3 pt-2 border-t border-border">
-      <label className="text-sm font-medium inline-flex items-center gap-2 cursor-pointer">
-        <input
-          type="checkbox"
-          checked={enabled}
-          onChange={(e) => setEnabled(e.target.checked)}
-          className="h-4 w-4 rounded border-border accent-primary"
-        />
-        <Users size={14} />
-        {t('splitGroups.splitTransaction')}
-      </label>
+  if (!enabled) return null
 
-      {enabled && (
+  return (
         <div className="space-y-3 pl-6">
           {!groups || groups.length === 0 ? (
             <p className="text-xs text-muted-foreground">
@@ -331,7 +324,5 @@ export function TransactionSplitsSection({
             </>
           )}
         </div>
-      )}
-    </div>
   )
 }

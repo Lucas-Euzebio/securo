@@ -698,12 +698,19 @@ export interface GroupSettlementPayload {
   currency: string
   date: string
   transaction_id?: string | null
+  // Mirrors transaction_id for the receiver side: when provided, links an
+  // existing credit transaction instead of auto-creating one.
+  receiver_transaction_id?: string | null
   notes?: string | null
   // When provided, the backend creates a debit transaction on this
   // account and links it via transaction_id. Mutually exclusive with
   // passing transaction_id directly.
   account_id?: string | null
   description?: string | null
+  // When true, skip the receiver-side credit entirely. Mutually
+  // exclusive with receiver_transaction_id. Omitting both keeps the
+  // default (auto-create) behavior.
+  skip_receiver_transaction?: boolean
 }
 
 export const groups = {

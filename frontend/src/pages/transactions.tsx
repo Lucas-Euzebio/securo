@@ -934,6 +934,16 @@ export default function TransactionsPage() {
                     })}
               </span>
             )}
+            {!tx.group_id && tx.settlement_group_id && (
+              <span
+                className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-violet-700 bg-violet-50 border border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900 px-1.5 py-0.5 rounded-full"
+                title={t('splitGroups.settlementRowTooltip')}
+              >
+                {t('splitGroups.settlementRowBadge', {
+                  group: groupNameById.get(tx.settlement_group_id) ?? '',
+                })}
+              </span>
+            )}
             {!!tx.transfer_pair_id && (
               <span className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-blue-600 bg-blue-50 border border-blue-200 px-1.5 py-0.5 rounded-full">
                 <ArrowLeftRight className="h-3 w-3" />

@@ -13,6 +13,9 @@ class GroupSettlementBase(BaseModel):
     currency: str = Field(min_length=3, max_length=3)
     date: _Date
     transaction_id: Optional[uuid.UUID] = None
+    # Mirrors `transaction_id` for the receiver side: when set, links an
+    # existing credit transaction instead of the service auto-creating one.
+    receiver_transaction_id: Optional[uuid.UUID] = None
     notes: Optional[str] = None
 
     @model_validator(mode="after")
@@ -30,6 +33,11 @@ class GroupSettlementCreate(GroupSettlementBase):
     # `transaction_id` directly.
     account_id: Optional[uuid.UUID] = None
     description: Optional[str] = None
+    # When true, skip the receiver-side credit entirely — neither create
+    # one nor link an existing transaction. Mutually exclusive with
+    # `receiver_transaction_id`. Omitting both keeps the default
+    # (auto-create) behavior for backward compatibility.
+    skip_receiver_transaction: bool = False
 
 
 class GroupSettlementUpdate(BaseModel):
@@ -39,6 +47,7 @@ class GroupSettlementUpdate(BaseModel):
     currency: Optional[str] = Field(default=None, min_length=3, max_length=3)
     date: Optional[_Date] = None
     transaction_id: Optional[uuid.UUID] = None
+    receiver_transaction_id: Optional[uuid.UUID] = None
     notes: Optional[str] = None
 
 

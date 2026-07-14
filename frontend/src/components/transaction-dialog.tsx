@@ -4,7 +4,8 @@ import { useTranslation } from 'react-i18next'
 import { useDateLocale } from '@/hooks/use-display-locale'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useAuth } from '@/contexts/auth-context'
-import { currencies as currenciesApi, transactions as transactionsApi, settings as settingsApi, payees as payeesApi, rules as rulesApi } from '@/lib/api'
+import { currencies as currenciesApi, transactions as transactionsApi, settings as settingsApi, payees as payeesApi, rules as rulesApi, groups as groupsApi } from '@/lib/api'
+import type { GroupSettlementPayload } from '@/lib/api'
 import { invalidateFinancialQueries } from '@/lib/invalidate-queries'
 import { normalizeRuleMatchValue } from '@/lib/rule-match-utils'
 import { cn, normalizeText } from '@/lib/utils'
@@ -22,7 +23,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog'
-import { AlertTriangle, ChevronDown, ChevronLeft, Download, Eye, EyeClosed, Paperclip, Upload, X, FileText, Plus, Unlink, SlidersHorizontal, ListPlus, Check } from 'lucide-react'
+import { AlertTriangle, ChevronDown, ChevronLeft, Download, Eye, EyeClosed, Paperclip, Upload, X, FileText, Plus, Unlink, SlidersHorizontal, ListPlus, Check, Link2, Users } from 'lucide-react'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -403,6 +404,96 @@ function TransactionForm({
   })
   const isCreating = !transaction
   const showConversion = currency !== userCurrency && !isSynced
+  // A saved, non-split transaction can offer to link to a settlement —
+  // unless it's already linked, in which case we show a read-only note
+  // instead of the checkbox.
+  const canLinkSettlement =
+    !isCreating && !!transaction && (transaction.splits ?? []).length === 0 && !transaction.settlement_group_id
+  const alreadyLinkedToSettlement =
+    !isCreating && !!transaction && (transaction.splits ?? []).length === 0 && !!transaction.settlement_group_id
+
+  // ── Split vs. link to a settlement ──────────────────────────────
+  // A transaction's role in a group is one of three mutually exclusive
+  // states: untouched, the (new) shared expense being split, or the
+  // payment clearing an existing settlement. One piece of state owns
+  // that choice so the two checkboxes behave like a radio pair —
+  // always clickable, picking one switches off the other — rather than
+  // disabling one while the other is active.
+  const [txGroupRole, setTxGroupRole] = useState<'none' | 'split' | 'settlement'>(
+    () => (splits !== null ? 'split' : 'none'),
+  )
+  const linkSettlementOpen = txGroupRole === 'settlement'
+  const [linkSettlementGroupId, setLinkSettlementGroupId] = useState('')
+  const [linkSettlementCounterpartId, setLinkSettlementCounterpartId] = useState('')
+  const [linkSettlementNotes, setLinkSettlementNotes] = useState('')
+
+  const { data: linkSettlementGroups } = useQuery({
+    queryKey: ['groups', 'all'],
+    queryFn: () => groupsApi.list(true),
+    // Also fetch when already linked — needed to resolve the group's
+    // name for the read-only "linked to X" note below.
+    enabled: linkSettlementOpen || alreadyLinkedToSettlement,
+    staleTime: 60_000,
+  })
+  // Mirrors TransactionSplitsSection's own "auto-pick the first group"
+  // behavior — no reason to make the user choose from an empty select
+  // when there's an obvious first candidate already loaded.
+  useEffect(() => {
+    if (!linkSettlementOpen || linkSettlementGroupId || !linkSettlementGroups || linkSettlementGroups.length === 0) return
+    setLinkSettlementGroupId(linkSettlementGroups[0].id)
+  }, [linkSettlementOpen, linkSettlementGroupId, linkSettlementGroups])
+
+  const { data: linkSettlementGroup } = useQuery({
+    queryKey: ['groups', linkSettlementGroupId],
+    queryFn: () => groupsApi.get(linkSettlementGroupId),
+    enabled: linkSettlementOpen && !!linkSettlementGroupId,
+  })
+  const linkSettlementSelfMember = linkSettlementGroup?.members.find((m) => m.is_self)
+  const linkSettlementCounterparts = (linkSettlementGroup?.members ?? []).filter((m) => !m.is_self)
+  // If there's only one possible counterpart, there's nothing to
+  // meaningfully choose — pick it automatically.
+  useEffect(() => {
+    if (linkSettlementCounterpartId || linkSettlementCounterparts.length !== 1) return
+    setLinkSettlementCounterpartId(linkSettlementCounterparts[0].id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [linkSettlementCounterparts])
+
+  const linkSettlementMutation = useMutation({
+    mutationFn: (payload: GroupSettlementPayload) =>
+      groupsApi.settlements.create(linkSettlementGroupId, payload),
+    onSuccess: () => {
+      toast.success(t('splitGroups.linkToSettlementSuccess'))
+      invalidateFinancialQueries(queryClient)
+      queryClient.invalidateQueries({ queryKey: ['groups'] })
+      setTxGroupRole('none')
+      setLinkSettlementGroupId('')
+      setLinkSettlementCounterpartId('')
+      setLinkSettlementNotes('')
+    },
+    onError: (err: unknown) => {
+      const detail =
+        err && typeof err === 'object' && 'response' in err
+          ? (err as { response?: { data?: { detail?: string } } }).response?.data?.detail
+          : undefined
+      toast.error(detail ?? t('common.error'))
+    },
+  })
+
+  const submitLinkSettlement = () => {
+    if (!transaction || !linkSettlementSelfMember || !linkSettlementCounterpartId) return
+    const isDebit = transaction.type === 'debit'
+    linkSettlementMutation.mutate({
+      from_member_id: isDebit ? linkSettlementSelfMember.id : linkSettlementCounterpartId,
+      to_member_id: isDebit ? linkSettlementCounterpartId : linkSettlementSelfMember.id,
+      amount: Number(transaction.amount),
+      currency: transaction.currency,
+      date: transaction.date,
+      notes: linkSettlementNotes.trim() || null,
+      transaction_id: isDebit ? transaction.id : undefined,
+      receiver_transaction_id: isDebit ? undefined : transaction.id,
+    })
+  }
+
   // Privacy mode hides monetary values across the app, but the edit modal
   // surfaced the raw amount anyway (issue #323). Only existing transactions
   // carry a value worth hiding — when creating, the user must see what they
@@ -970,17 +1061,125 @@ function TransactionForm({
       })()}
 
       {/* A settlement-sourced transaction *is* the movement clearing a
-          group debt; splitting it would create circular accounting
-          (the share would settle a debt that this debit is already
-          settling). Hide the section entirely in that case. */}
+          group debt; splitting it, or linking it to ANOTHER settlement,
+          would create circular accounting. Hide this whole area then. */}
       {transaction?.source !== 'settlement' && (
-        <TransactionSplitsSection
-          amount={parseFloat(amount) || 0}
-          currency={currency}
-          value={splits}
-          onChange={setSplits}
-          onValidityChange={setSplitsValid}
-        />
+        <div className="space-y-3 pt-2 border-t border-border">
+          <div className="flex items-center gap-6">
+            <label className="text-sm font-medium inline-flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={txGroupRole === 'split'}
+                onChange={(e) => setTxGroupRole(e.target.checked ? 'split' : 'none')}
+                className="h-4 w-4 rounded border-border accent-primary"
+              />
+              <Users size={14} />
+              {t('splitGroups.splitTransaction')}
+            </label>
+            {canLinkSettlement && (
+              <label className="text-sm font-medium inline-flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={txGroupRole === 'settlement'}
+                  onChange={(e) => setTxGroupRole(e.target.checked ? 'settlement' : 'none')}
+                  className="h-4 w-4 rounded border-border accent-primary"
+                />
+                <Link2 size={14} />
+                {t('splitGroups.linkToSettlement')}
+              </label>
+            )}
+          </div>
+
+          <TransactionSplitsSection
+            amount={parseFloat(amount) || 0}
+            currency={currency}
+            value={splits}
+            onChange={setSplits}
+            onValidityChange={setSplitsValid}
+            enabled={txGroupRole === 'split'}
+          />
+
+          {txGroupRole === 'settlement' && canLinkSettlement && (
+            <div className="space-y-2 pl-6">
+              <select
+                className="w-full border border-border rounded-md px-3 py-2 text-sm bg-background"
+                value={linkSettlementGroupId}
+                onChange={(e) => {
+                  setLinkSettlementGroupId(e.target.value)
+                  setLinkSettlementCounterpartId('')
+                }}
+              >
+                <option value="">{t('splitGroups.linkToSettlementGroup')}</option>
+                {(linkSettlementGroups ?? []).map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+              {linkSettlementGroupId && (
+                linkSettlementSelfMember ? (
+                  <>
+                    <select
+                      className="w-full border border-border rounded-md px-3 py-2 text-sm bg-background"
+                      value={linkSettlementCounterpartId}
+                      onChange={(e) => setLinkSettlementCounterpartId(e.target.value)}
+                    >
+                      <option value="">{t('splitGroups.linkToSettlementSelectCounterpart')}</option>
+                      {linkSettlementCounterparts.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.name}
+                        </option>
+                      ))}
+                    </select>
+                    {linkSettlementCounterpartId && (
+                      <p className="text-xs text-muted-foreground">
+                        {t(
+                          transaction!.type === 'debit'
+                            ? 'splitGroups.linkToSettlementHintDebit'
+                            : 'splitGroups.linkToSettlementHintCredit',
+                          {
+                            name: linkSettlementCounterparts.find(
+                              (m) => m.id === linkSettlementCounterpartId,
+                            )?.name ?? '',
+                          },
+                        )}
+                      </p>
+                    )}
+                    <textarea
+                      className="w-full border border-input rounded-md px-3 py-2 text-sm bg-background resize-none"
+                      rows={2}
+                      placeholder={t('splitGroups.notes')}
+                      value={linkSettlementNotes}
+                      onChange={(e) => setLinkSettlementNotes(e.target.value)}
+                    />
+                    <Button
+                      type="button"
+                      size="sm"
+                      disabled={!linkSettlementCounterpartId || linkSettlementMutation.isPending}
+                      onClick={submitLinkSettlement}
+                    >
+                      {t('splitGroups.linkToSettlementSubmit')}
+                    </Button>
+                  </>
+                ) : (
+                  <p className="text-xs text-amber-600">
+                    {t('splitGroups.linkToSettlementNoSelfMember')}
+                  </p>
+                )
+              )}
+            </div>
+          )}
+
+          {alreadyLinkedToSettlement && (
+            <p className="text-xs text-muted-foreground">
+              {t('splitGroups.alreadyLinkedToSettlement', {
+                group:
+                  linkSettlementGroups?.find((g) => g.id === transaction?.settlement_group_id)
+                    ?.name ?? '',
+              })}
+            </p>
+          )}
+        </div>
       )}
 
       {!isCreating && transaction ? (
