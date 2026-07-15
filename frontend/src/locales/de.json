@@ -622,7 +622,10 @@
       "simplefin": {
         "title": "Verbindung über SimpleFIN",
         "description": "SimpleFIN is a read-only bank data protocol. Go to the SimpleFIN Bridge, pick your bank, and copy the setup token back here."
-      }
+      },
+      "reconnectTitle": "Mit einem neuen Token erneut verbinden",
+      "reconnectDescription": "Füge ein neues Setup-Token ein, um diese Verbindung direkt zu aktualisieren. Bestehende Konten, Transaktionen, Kategorien und Regeln bleiben erhalten.",
+      "reconnect": "Erneut verbinden"
     },
     "providers": {
       "pluggy": {
@@ -634,7 +637,8 @@
       "simplefin": {
         "description": "US-amerikanische und internationale Banken via SimpleFIN Bridge"
       }
-    }
+    },
+    "reconnected": "Bank erfolgreich erneut verbunden"
   },
   "connections": {
     "settings": "Verbindungseinstellungen",
@@ -1081,6 +1085,10 @@
     "syncedFromHint": "Ursprünglich synchronisiert aus {{source}} — du kannst den Namen frei anpassen, die Synchronisierung verwendet die Verbindungs-ID.",
     "chartByWallet": "Nach Portfolio",
     "chartByAsset": "Nach Vermögenswert",
+    "chartGroupMode": "Diagrammgruppierung",
+    "chartDrawMode": "Diagrammdarstellung",
+    "chartStacked": "Gestapelt",
+    "chartLines": "Linien",
     "portfolioValue": "Portfoliowert",
     "total": "Gesamt",
     "confirmRegenerateTitle": "Werte neu generieren?",
@@ -1161,6 +1169,8 @@
     "range30d": "30T"
   },
   "payees": {
+    "addFavorite": "Zu Favoriten hinzufügen",
+    "removeFavorite": "Aus Favoriten entfernen",
     "title": "Zahlungsempfänger",
     "section": "Einrichtung",
     "payee": "Zahlungsempfänger",
@@ -1196,6 +1206,7 @@
     "favoritesOnly": "Nur Favoriten"
   },
   "common": {
+    "view": "Ansehen",
     "save": "Speichern",
     "cancel": "Abbrechen",
     "close": "Schließen",
@@ -1326,6 +1337,8 @@
     "date": "Datum",
     "splitTransaction": "Diese Transaktion aufteilen",
     "splitNoGroups": "Erstelle zuerst eine Gruppe, um eine Transaktion aufzuteilen.",
+    "splitNoGroupsLinkPrefix": "Du hast noch keine Gruppe. Du kannst ",
+    "splitNoGroupsLinkSuffix": "hier eine erstellen",
     "splitNoMembers": "Füge zuerst Mitglieder zur Gruppe hinzu.",
     "group": "Gruppe",
     "shareType": "Aufteilen nach",
