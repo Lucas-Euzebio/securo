@@ -1,7 +1,7 @@
 """split a transaction into multiple child transactions (multi-category split)
 
-Revision ID: 065
-Revises: 064
+Revision ID: 066
+Revises: 065
 Create Date: 2026-07-13
 
 Adds `transactions.parent_transaction_id`: a self-referential FK used when a
@@ -20,8 +20,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import UUID
 
-revision: str = "065"
-down_revision: Union[str, None] = "064"
+revision: str = "066"
+down_revision: Union[str, None] = "065"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
