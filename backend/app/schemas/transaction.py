@@ -3,7 +3,7 @@ from datetime import date as _Date
 from decimal import Decimal
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.category import CategoryRead
 from app.schemas.transaction_split import (
@@ -119,6 +119,12 @@ class TransactionRead(TransactionBase):
     split_children: Optional[list[SplitChildInfo]] = None
     split_parent_description: Optional[str] = None
     is_ignored: bool = False
+
+    @model_validator(mode="after")
+    def reflect_ignored_category(self):
+        if self.category and self.category.is_ignored:
+            self.is_ignored = True
+        return self
 
     model_config = ConfigDict(from_attributes=True)
 
