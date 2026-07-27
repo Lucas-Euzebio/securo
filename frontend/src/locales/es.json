@@ -123,7 +123,8 @@
     "groupAdmin": "Administración",
     "groupAgents": "IA",
     "agents": "Agentes",
-    "aiAgents": "Agentes IA"
+    "aiAgents": "Agentes IA",
+    "categoryReport": "Matriz de categorías"
   },
   "collections": {
     "title": "Colecciones",
@@ -1733,5 +1734,21 @@
         "openai": "OpenAI Responses API"
       }
     }
+  },
+  "categoryReport": {
+    "title": "Categoría × Mes",
+    "subtitle": "Gasto mensual por categoría — detecta patrones y calibra presupuestos. Haz clic en una celda para ver sus transacciones.",
+    "avg": "Prom./mes",
+    "total": "Total",
+    "budget": "Presupuesto",
+    "ungrouped": "Sin grupo",
+    "empty": "Sin gastos en este período",
+    "collapseAll": "Contraer todo",
+    "expandAll": "Expandir todo",
+    "from": "Desde",
+    "to": "Hasta",
+    "budgetTooltip": "Promedio del presupuesto vigente en los meses del período seleccionado (los meses sin presupuesto no cuentan).",
+    "includeCurrentMonth": "Incluir mes actual",
+    "includeCurrentMonthTooltip": "Desactivado, el mes actual (parcial) queda fuera de los promedios mensuales — sigue visible en la tabla de todos modos."
   }
 }

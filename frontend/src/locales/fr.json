@@ -123,7 +123,8 @@
     "groupAdmin": "Administration",
     "groupAgents": "IA",
     "agents": "Agents",
-    "aiAgents": "Agents IA"
+    "aiAgents": "Agents IA",
+    "categoryReport": "Matrice des catégories"
   },
   "collections": {
     "title": "Collections",
@@ -1733,5 +1734,21 @@
         "subtitle": "Ajoutez une connexion pour pointer Securo vers votre Ollama local, OpenAI, Anthropic, ou tout point de terminaison compatible OpenAI."
       }
     }
+  },
+  "categoryReport": {
+    "title": "Catégorie × Mois",
+    "subtitle": "Dépenses mensuelles par catégorie — repérez les tendances et calibrez vos budgets. Cliquez sur une cellule pour voir ses transactions.",
+    "avg": "Moy./mois",
+    "total": "Total",
+    "budget": "Budget",
+    "ungrouped": "Sans groupe",
+    "empty": "Aucune dépense sur cette période",
+    "collapseAll": "Tout replier",
+    "expandAll": "Tout déplier",
+    "from": "De",
+    "to": "À",
+    "budgetTooltip": "Moyenne du budget en vigueur sur les mois de la période sélectionnée (les mois sans budget ne comptent pas).",
+    "includeCurrentMonth": "Inclure le mois en cours",
+    "includeCurrentMonthTooltip": "Désactivé, le mois en cours (partiel) est exclu des moyennes mensuelles — il reste visible dans le tableau."
   }
 }

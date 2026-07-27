@@ -123,7 +123,8 @@
     "groupAdmin": "Administration",
     "groupAgents": "KI",
     "agents": "Agenten",
-    "aiAgents": "KI-Agenten"
+    "aiAgents": "KI-Agenten",
+    "categoryReport": "Kategorie-Matrix"
   },
   "collections": {
     "title": "Sammlungen",
@@ -1733,5 +1734,21 @@
         "subtitle": "Füge eine Verbindung hinzu, um Securo auf dein lokales Ollama, OpenAI, Anthropic oder einen OpenAI-kompatiblen Endpunkt zu verweisen."
       }
     }
+  },
+  "categoryReport": {
+    "title": "Kategorie × Monat",
+    "subtitle": "Monatliche Ausgaben pro Kategorie — Muster erkennen und Budgets kalibrieren. Klicken Sie auf eine Zelle, um die Transaktionen zu sehen.",
+    "avg": "Ø/Monat",
+    "total": "Gesamt",
+    "budget": "Budget",
+    "ungrouped": "Ohne Gruppe",
+    "empty": "Keine Ausgaben in diesem Zeitraum",
+    "collapseAll": "Alle einklappen",
+    "expandAll": "Alle ausklappen",
+    "from": "Von",
+    "to": "Bis",
+    "budgetTooltip": "Durchschnitt des in den ausgewählten Monaten geltenden Budgets (Monate ohne Budget zählen nicht).",
+    "includeCurrentMonth": "Aktuellen Monat einbeziehen",
+    "includeCurrentMonthTooltip": "Wenn deaktiviert, bleibt der aktuelle (unvollständige) Monat aus den Monatsdurchschnitten heraus — in der Tabelle bleibt er trotzdem sichtbar."
   }
 }

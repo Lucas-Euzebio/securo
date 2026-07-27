@@ -123,7 +123,8 @@
     "groupAdmin": "Administration",
     "groupAgents": "AI",
     "agents": "Agents",
-    "aiAgents": "AI Agents"
+    "aiAgents": "AI Agents",
+    "categoryReport": "Category Matrix"
   },
   "collections": {
     "title": "Collections",
@@ -1733,5 +1734,21 @@
         "subtitle": "Add a connection to point Securo at your local Ollama, OpenAI, Anthropic, or any OpenAI-compatible endpoint."
       }
     }
+  },
+  "categoryReport": {
+    "title": "Category × Month",
+    "subtitle": "Monthly spending per category — spot patterns and calibrate budgets. Click a cell to see its transactions.",
+    "avg": "Avg/mo",
+    "total": "Total",
+    "budget": "Budget",
+    "ungrouped": "Ungrouped",
+    "empty": "No expenses in this period",
+    "collapseAll": "Collapse all",
+    "expandAll": "Expand all",
+    "from": "From",
+    "to": "To",
+    "budgetTooltip": "Average of the budget in effect across the selected months (months without a budget are not counted).",
+    "includeCurrentMonth": "Include current month",
+    "includeCurrentMonthTooltip": "When off, the current (partial) month is left out of the monthly averages — it stays visible in the table either way."
   }
 }

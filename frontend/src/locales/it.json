@@ -123,7 +123,8 @@
     "groupAdmin": "Amministrazione",
     "groupAgents": "IA",
     "agents": "Agenti",
-    "aiAgents": "Agenti IA"
+    "aiAgents": "Agenti IA",
+    "categoryReport": "Matrice categorie"
   },
   "collections": {
     "title": "Collezioni",
@@ -1733,5 +1734,21 @@
         "openai": "OpenAI Responses API"
       }
     }
+  },
+  "categoryReport": {
+    "title": "Categoria × Mese",
+    "subtitle": "Spesa mensile per categoria — individua i pattern e calibra i budget. Clicca su una cella per vedere le transazioni.",
+    "avg": "Media/mese",
+    "total": "Totale",
+    "budget": "Budget",
+    "ungrouped": "Senza gruppo",
+    "empty": "Nessuna spesa in questo periodo",
+    "collapseAll": "Comprimi tutto",
+    "expandAll": "Espandi tutto",
+    "from": "Da",
+    "to": "A",
+    "budgetTooltip": "Media del budget in vigore nei mesi del periodo selezionato (i mesi senza budget non contano).",
+    "includeCurrentMonth": "Includi mese corrente",
+    "includeCurrentMonthTooltip": "Disattivato, il mese corrente (parziale) resta fuori dalle medie mensili — rimane comunque visibile nella tabella."
   }
 }

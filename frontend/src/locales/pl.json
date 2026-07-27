@@ -123,7 +123,8 @@
     "groupAgents": "AI",
     "agents": "Agenci",
     "aiAgents": "Agenci AI",
-    "collections": "Kolekcje"
+    "collections": "Kolekcje",
+    "categoryReport": "Macierz kategorii"
   },
   "collections": {
     "title": "Kolekcje",
@@ -1823,5 +1824,21 @@
         "openai": "OpenAI Responses API"
       }
     }
+  },
+  "categoryReport": {
+    "title": "Kategoria × Miesiąc",
+    "subtitle": "Miesięczne wydatki wg kategorii — znajdź wzorce i dopasuj budżety. Kliknij komórkę, aby zobaczyć transakcje.",
+    "avg": "Śr./mies.",
+    "total": "Suma",
+    "budget": "Budżet",
+    "ungrouped": "Bez grupy",
+    "empty": "Brak wydatków w tym okresie",
+    "collapseAll": "Zwiń wszystko",
+    "expandAll": "Rozwiń wszystko",
+    "from": "Od",
+    "to": "Do",
+    "budgetTooltip": "Średnia budżetu obowiązującego w miesiącach wybranego okresu (miesiące bez budżetu nie są liczone).",
+    "includeCurrentMonth": "Uwzględnij bieżący miesiąc",
+    "includeCurrentMonthTooltip": "Gdy wyłączone, bieżący (niepełny) miesiąc nie wchodzi do średnich miesięcznych — nadal jest widoczny w tabeli."
   }
 }

@@ -123,7 +123,8 @@
     "groupAdmin": "Administração",
     "groupAgents": "IA",
     "agents": "Agentes",
-    "aiAgents": "Agentes IA"
+    "aiAgents": "Agentes IA",
+    "categoryReport": "Categorias × Mês"
   },
   "collections": {
     "title": "Coleções",
@@ -1733,5 +1734,21 @@
         "openai": "OpenAI Responses API"
       }
     }
+  },
+  "categoryReport": {
+    "title": "Categorias × Mês",
+    "subtitle": "Gasto mensal por categoria — encontre padrões e calibre orçamentos. Clique numa célula para ver as transações.",
+    "avg": "Média/mês",
+    "total": "Total",
+    "budget": "Orçamento",
+    "ungrouped": "Sem grupo",
+    "empty": "Sem despesas neste período",
+    "collapseAll": "Recolher todos",
+    "expandAll": "Expandir todos",
+    "from": "De",
+    "to": "Até",
+    "budgetTooltip": "Média do orçamento vigente nos meses do período selecionado (meses sem orçamento não entram na conta).",
+    "includeCurrentMonth": "Incluir mês atual",
+    "includeCurrentMonthTooltip": "Desligado, o mês atual (parcial) fica de fora das médias mensais — ele continua visível na tabela de qualquer forma."
   }
 }
